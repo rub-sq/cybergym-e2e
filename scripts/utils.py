@@ -433,14 +433,15 @@ def get_llm_env(
         if not kiconnect_api_key:
             raise RuntimeError("KICONNECT_API_KEY env var not set; required for kiconnect mode")
 
-        llm_model = kiconnect_model_id
+        # LiteLLM requires the openai/ prefix to route this as a generic
+        # OpenAI-compatible provider instead of trying to guess from the bare model name.
+        llm_model = f"openai/{kiconnect_model_id}"
         env = {
             **base_env,
             "LLM_MODEL": llm_model,
             "LLM_API_KEY": kiconnect_api_key,
             "OPENAI_API_KEY": kiconnect_api_key,
             "OPENAI_BASE_URL": "https://chat.kiconnect.nrw/api/v1",
-            # LiteLLM will use openai/* prefix to route this as OpenAI-compatible
             "LLM_DROP_PARAMS": "false",
         }
         return env, llm_model
