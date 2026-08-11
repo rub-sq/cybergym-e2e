@@ -352,6 +352,7 @@ def get_llm_env(
     litellm_model_id=None,
     bedrock_model_id=None,
     anthropic_model_id=None,
+    kiconnect_model_id=None,
     aws_region="us-west-2",
     aws_profile=None,
 ):
@@ -359,10 +360,11 @@ def get_llm_env(
     Get LLM environment variables for OpenHands.
 
     Args:
-        model_provider: "bedrock", "anthropic", or "litellm"
+        model_provider: "bedrock", "anthropic", "litellm", or "kiconnect"
         litellm_model_id: LiteLLM model ID (required if model_provider="litellm")
         bedrock_model_id: Bedrock model ID (required if model_provider="bedrock")
         anthropic_model_id: Anthropic model ID (required if model_provider="anthropic")
+        kiconnect_model_id: KIConnect model ID (required if model_provider="kiconnect")
         aws_region: AWS region for Bedrock
         aws_profile: AWS profile name for credentials
 
@@ -424,6 +426,22 @@ def get_llm_env(
             "LLM_MODEL": llm_model,
             "LLM_API_KEY": anthropic_api_key,
             "ANTHROPIC_API_KEY": anthropic_api_key,
+        }
+        return env, llm_model
+    elif model_provider == "kiconnect":
+        kiconnect_api_key = os.getenv("KICONNECT_API_KEY", "")
+        if not kiconnect_api_key:
+            raise RuntimeError("KICONNECT_API_KEY env var not set; required for kiconnect mode")
+
+        llm_model = kiconnect_model_id
+        env = {
+            **base_env,
+            "LLM_MODEL": llm_model,
+            "LLM_API_KEY": kiconnect_api_key,
+            "OPENAI_API_KEY": kiconnect_api_key,
+            "OPENAI_BASE_URL": "https://chat.kiconnect.nrw/api/v1",
+            # LiteLLM will use openai/* prefix to route this as OpenAI-compatible
+            "LLM_DROP_PARAMS": "false",
         }
         return env, llm_model
     else:

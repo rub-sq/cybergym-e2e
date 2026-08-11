@@ -565,6 +565,7 @@ def _execute_openhands(container_id, prompt, args):
         litellm_model_id=args.litellm_model_id,
         bedrock_model_id=args.bedrock_model_id,
         anthropic_model_id=args.anthropic_model_id,
+        kiconnect_model_id=args.kiconnect_model_id,
         aws_region=args.aws_region,
         aws_profile=args.aws_profile,
     )
@@ -607,6 +608,7 @@ def _execute_codex(container_id, prompt, output_file, args):
     env, llm_model = get_llm_env(
         model_provider=args.model_provider,
         litellm_model_id=args.litellm_model_id,
+        kiconnect_model_id=args.kiconnect_model_id,
     )
 
     # prepare auth.json
@@ -689,6 +691,7 @@ def _execute_gemini_cli(container_id, prompt, output_file, args):
     env, llm_model = get_llm_env(
         model_provider=args.model_provider,
         litellm_model_id=args.litellm_model_id,
+        kiconnect_model_id=args.kiconnect_model_id,
     )
 
     # prepare settings.json
@@ -1046,12 +1049,14 @@ Examples:
                         default="gcr.io/oss-fuzz-base/base-builder@sha256:8eda74a11e800aead5a041ee479a65b33dab3150d6e89e5694e2b6eb27be98fc")
 
     # LLM configuration
-    parser.add_argument("--model-provider", choices=["litellm", "bedrock", "anthropic"], default="anthropic",
+    parser.add_argument("--model-provider", choices=["litellm", "bedrock", "anthropic", "kiconnect"], default="anthropic",
                         help="LLM provider (default: anthropic)")
     parser.add_argument("--litellm-model-id", default="openai/gpt-5.2-codex")
     parser.add_argument("--bedrock-model-id", default="us.anthropic.claude-sonnet-4-5-20250929-v1:0")
     parser.add_argument("--anthropic-model-id", default="claude-sonnet-4-5",
                         help="Model ID used with --model-provider anthropic (reads ANTHROPIC_API_KEY from env)")
+    parser.add_argument("--kiconnect-model-id", default="openai-gpt-oss-120b",
+                        help="Model ID used with --model-provider kiconnect (reads KICONNECT_API_KEY from env)")
     parser.add_argument("--aws-region", default="us-west-2")
     parser.add_argument("--aws-profile", default=None)
 
@@ -1071,19 +1076,25 @@ Examples:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Litellm create key
+    generated_api_key = None
     if args.model_provider == "litellm":
-        generated_api_key = litellm_generate_api_key(
-            max_budget=10, key_alias=f"cybergym-e2e-{timestamp}-{uuid.uuid4().hex[:8]}"
-        )
-        os.environ["OPENAI_BASE_URL"] = os.getenv("LITELLM_BASE_URL")
-        os.environ["OPENAI_API_KEY"] = generated_api_key
-        os.environ["GOOGLE_GEMINI_BASE_URL"] = os.getenv("LITELLM_BASE_URL")
+        try:
+            generated_api_key = litellm_generate_api_key(
+                max_budget=10, key_alias=f"cybergym-e2e-{timestamp}-{uuid.uuid4().hex[:8]}"
+            )
+            os.environ["OPENAI_BASE_URL"] = os.getenv("LITELLM_BASE_URL")
+            os.environ["OPENAI_API_KEY"] = generated_api_key
+        except Exception as e:
+            print(f"Litellm key generation unavailable ({e}); falling back to OPENAI_BASE_URL/OPENAI_API_KEY from environment")
+        if os.getenv("LITELLM_BASE_URL"):
+            os.environ["GOOGLE_GEMINI_BASE_URL"] = os.getenv("LITELLM_BASE_URL")
 
     _, llm_model = get_llm_env(
         model_provider=args.model_provider,
         litellm_model_id=args.litellm_model_id,
         bedrock_model_id=args.bedrock_model_id,
         anthropic_model_id=args.anthropic_model_id,
+        kiconnect_model_id=args.kiconnect_model_id,
         aws_region=args.aws_region,
         aws_profile=args.aws_profile,
     )
@@ -1127,7 +1138,7 @@ Examples:
     }
 
     # Litellm delete key
-    if args.model_provider == "litellm":
+    if args.model_provider == "litellm" and generated_api_key:
         try:
             usage = litellm_get_api_key_usage(generated_api_key)
             print(f"Litellm API key usage: {usage}")
