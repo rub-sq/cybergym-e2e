@@ -196,6 +196,28 @@ def setup_workspace(container_id, data_path, script_path, mode="e2e", copy_gt_po
     copy_to_container(container_id, data_path / "src.tgz", "/src/src.tgz")
     exec_run(container_id, "tar xf /src/src.tgz -C /src && rm /src/src.tgz", workdir="/", verbose=False, check=True)
 
+    # Baseline-commit every extracted project dir so agents can capture their edits with a
+    # plain `git diff` regardless of whether the tarball shipped its own .git (some OSS-Fuzz
+    # snapshots do, most don't). Re-init any existing repo too, so the baseline always starts
+    # clean at "freshly extracted" rather than whatever history the tarball happened to carry.
+    exec_run(
+        container_id,
+        r"""for d in /src/*/; do
+  [ -d "$d" ] || continue
+  ( cd "$d" \
+    && rm -rf .git \
+    && git init -q \
+    && git config user.email "cybergym@localhost" \
+    && git config user.name "cybergym" \
+    && git add -A \
+    && git commit -q -m "baseline" --allow-empty )
+done""",
+        "Baseline-committing extracted source for git diff support",
+        workdir="/",
+        verbose=False,
+        check=True,
+    )
+
     # Copy crash.log and poc.bin for patch-only mode (to /src for agent to see)
     if mode == "patch-only":
         for f in ["crash.log", "poc.bin"]:

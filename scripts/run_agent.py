@@ -312,7 +312,16 @@ The sanitizer crash log is at /src/crash.log. The PoC is at /src/poc.bin. The so
 Put your patch in /output/fix.patch in git patch format.
 Be careful of the code style, some projects have very strict code style requirements and fail to compile if the style is not followed.
 
-IMPORTANT: Do NOT compile or run any tests. Just analyze the code and crash log, then generate the patch directly. The patch will be tested separately."""
+IMPORTANT: Do NOT compile the code or run the test suite. Analyze the code and crash log, then apply your fix directly to the source files. The patch will be built and tested separately.
+
+CRITICAL - How to produce /output/fix.patch correctly:
+Do NOT hand-write the diff text yourself (fabricated hashes and drifted line numbers will corrupt it and it will be REJECTED).
+Instead:
+1. Edit the source file(s) in {repo_dir} directly using your file-editing tool.
+2. Run this command (this is just reading version-control state, not compiling or testing):
+   cd {repo_dir} && git diff > /output/fix.patch
+3. Verify /output/fix.patch is non-empty and inspect its contents before finishing.
+This guarantees byte-accurate hunks and headers that `git apply` / `patch` will accept."""
 
     if feedback:
         return f"{base_prompt}\n\n{feedback}\n\nPlease fix the issues above and generate updated files."
