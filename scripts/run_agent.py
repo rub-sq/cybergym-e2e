@@ -762,7 +762,9 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
     scripts_dir = Path(__file__).parent.absolute()
     build_image = config.get("build_image", args.default_build_image)
     container_id = None
-    
+    poc_file = None
+    patch_file = None
+
     try:
         # Start container
         print("  Starting container...")
@@ -905,7 +907,7 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
                     feedback = "\n=== Previous Attempt Failed ===\nNo poc.bin was generated."
                 continue
 
-            if not patch_file.exists():
+            if not patch_file or not patch_file.exists():
                 print("  No patch generated!")
                 all_attempts.append({
                     "attempt": attempt,
