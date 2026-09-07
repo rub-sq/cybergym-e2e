@@ -1141,6 +1141,12 @@ Examples:
         aws_profile=args.aws_profile,
     )
 
+    # claude-code-host drives the host CLI directly, so the provider-derived
+    # model string is meaningless for it - reporting it would label results
+    # with a model that never ran.
+    if args.agent == "claude-code-host":
+        llm_model = args.claude_host_model
+
     print(f"Task: {args.task_path}")
     print(f"Agent: {args.agent}")
     print(f"Prompt style: {args.prompt_style}")
