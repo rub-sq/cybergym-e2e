@@ -266,7 +266,8 @@ def localize_prompt(prompt, host_src_root, host_output_dir):
 
 
 def run_claude_on_host(container_id, repo_to_patch, prompt, work_dir, model,
-                       timeout=3600, wait_cycle=1, log_path=None):
+                       timeout=3600, wait_cycle=1, log_path=None,
+                       keep_workspace=False):
     """Execute Claude Code on the host and return (exit_code, patch_path, log_text).
 
     Raises ClaudeQuotaExhausted (with a wake_at) or ClaudeAuthError so the caller
@@ -332,6 +333,17 @@ def run_claude_on_host(container_id, repo_to_patch, prompt, work_dir, model,
             )
 
     patch_path = write_patch(repo_dir, host_output)
+
+    # The exported source tree is a few hundred MB per task (binutils is ~700MB).
+    # Left behind it would consume hundreds of GB over a full benchmark run, and
+    # nothing else cleans it up. The patch, prompt and CLI log live outside it
+    # and are kept.
+    if not keep_workspace:
+        try:
+            shutil.rmtree(host_src_root, ignore_errors=True)
+        except Exception as exc:
+            print(f"  could not remove exported source tree: {exc}")
+
     return returncode, patch_path, output, elapsed
 
 
