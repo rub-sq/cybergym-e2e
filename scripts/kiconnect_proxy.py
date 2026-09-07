@@ -67,6 +67,7 @@ def adapt_chat_request(payload, model):
 # and OpenHands only speak chat-completions, so the translation happens here.
 # Shapes below were taken from live responses on this endpoint, not from docs.
 RESPONSES_MODEL_RE = re.compile(r"codex", re.IGNORECASE)
+MIN_OUTPUT_TOKENS = 16
 
 
 def needs_responses_api(model):
@@ -119,7 +120,9 @@ def chat_to_responses(payload):
 
     limit = payload.get("max_completion_tokens") or payload.get("max_tokens")
     if limit:
-        out["max_output_tokens"] = limit
+        # /responses rejects anything below 16 outright; clamp rather than let a
+        # small caller-supplied cap fail the whole request.
+        out["max_output_tokens"] = max(int(limit), MIN_OUTPUT_TOKENS)
     for passthrough in ("temperature", "top_p", "metadata"):
         if payload.get(passthrough) is not None:
             out[passthrough] = payload[passthrough]
