@@ -32,10 +32,13 @@ import sys
 import json
 import shutil
 import shlex
+import shutil
 import time
 import uuid
 import tempfile
 from pathlib import Path
+
+import claude_host_runner
 
 import tomli
 
@@ -803,14 +806,27 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
         # Setup workspace (don't copy ground truth PoC - agent shouldn't see it)
         setup_workspace(container_id, data_path, script_path, args.mode, copy_gt_poc=False, scripts_dir=scripts_dir)
 
-        # Install agent
-        install(container_id, args.agent, scripts_dir=scripts_dir)
+        # Install agent. claude-code-host drives the host's own logged-in CLI,
+        # so nothing needs installing inside the container.
+        if args.agent != "claude-code-host":
+            install(container_id, args.agent, scripts_dir=scripts_dir)
 
         # Execute agent
         log_file = trajectory_dir / f"attempt_{attempt}.log"
 
         agent_exec_start = time.time()
-        if args.agent == "claude-code":
+        if args.agent == "claude-code-host":
+            exit_code, host_patch, _out, _el = claude_host_runner.run_claude_on_host(
+                container_id=container_id,
+                repo_to_patch=config.get("repo_to_patch"),
+                prompt=prompt,
+                work_dir=work_dir / "host_workspace",
+                model=args.claude_host_model,
+                timeout=args.timeout,
+                wait_cycle=attempt,
+                log_path=str(log_file),
+            )
+        elif args.agent == "claude-code":
             exit_code = _execute_claude_code(container_id, prompt, str(log_file), args)
         elif args.agent == "codex":
             exit_code = _execute_codex(container_id, prompt, str(log_file), args)
@@ -833,16 +849,29 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
             ["docker", "cp", f"{container_id}:/output/poc.bin", str(local_output / "poc.bin")],
             capture_output=True
         )
-        subprocess.run(
-            ["docker", "cp", f"{container_id}:/output/fix.patch", str(local_output / "fix.patch")],
-            capture_output=True
-        )
+        if args.agent == "claude-code-host":
+            if host_patch and Path(host_patch).is_file():
+                shutil.copy(str(host_patch), str(local_output / "fix.patch"))
+        else:
+            subprocess.run(
+                ["docker", "cp", f"{container_id}:/output/fix.patch", str(local_output / "fix.patch")],
+                capture_output=True
+            )
 
         poc_file = local_output / "poc.bin"
         patch_file = local_output / "fix.patch"
 
         return exit_code, poc_file, patch_file, log_file, container_id, agent_exec_time
 
+    except claude_host_runner.ClaudeQuotaExhausted as e:
+        # Emit a machine-readable marker so an orchestrator can sleep exactly
+        # until the subscription window reopens instead of blind polling.
+        print(f"CLAUDE_QUOTA_EXHAUSTED wake_at={e.wake_at.isoformat()}")
+        print(f"  Claude quota exhausted; resume at {e.wake_at.isoformat()}")
+        return 125, None, None, None, container_id, 0
+    except claude_host_runner.ClaudeAuthError as e:
+        print(f"CLAUDE_AUTH_ERROR {e}")
+        return 126, None, None, None, container_id, 0
     except Exception as e:
         print(f"  Agent execution error: {e}")
         import traceback
@@ -1038,7 +1067,7 @@ Examples:
     parser.add_argument("task_path", help="Task path (e.g., curl/arvo_66012)")
 
     # Agent selection
-    parser.add_argument("--agent", choices=["claude-code", "openhands", "codex", "gemini-cli"], default="claude-code",
+    parser.add_argument("--agent", choices=["claude-code", "claude-code-host", "openhands", "codex", "gemini-cli"], default="claude-code",
                         help="Agent backend to use (default: claude-code)")
     parser.add_argument("--prompt-style", choices=["iterative", "no-test"], default="iterative",
                         help="Prompt style: iterative (can test) or no-test (default: iterative)")
@@ -1066,6 +1095,8 @@ Examples:
     parser.add_argument("--bedrock-model-id", default="us.anthropic.claude-sonnet-4-5-20250929-v1:0")
     parser.add_argument("--anthropic-model-id", default="claude-sonnet-4-5",
                         help="Model ID used with --model-provider anthropic (reads ANTHROPIC_API_KEY from env)")
+    parser.add_argument("--claude-host-model", default="sonnet",
+                        help="Model for --agent claude-code-host (host CLI, subscription auth)")
     parser.add_argument("--kiconnect-model-id", default="openai-gpt-oss-120b",
                         help="Model ID used with --model-provider kiconnect (reads KICONNECT_API_KEY from env)")
     parser.add_argument("--aws-region", default="us-west-2")

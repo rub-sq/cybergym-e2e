@@ -99,7 +99,9 @@ def start_container(image, env_vars=None, container_name=None, workdir=None):
     Returns:
         Container ID
     """
-    cmd = ["docker", "run", "-d", "--rm"]
+    # host.docker.internal lets the agent reach a proxy running on the host
+    # (used for KIConnect key rotation); harmless when nothing listens there.
+    cmd = ["docker", "run", "-d", "--rm", "--add-host=host.docker.internal:host-gateway"]
 
     if container_name:
         cmd.extend(["--name", container_name])
@@ -451,9 +453,16 @@ def get_llm_env(
         }
         return env, llm_model
     elif model_provider == "kiconnect":
+        # KICONNECT_BASE_URL redirects traffic to scripts/kiconnect_proxy.py, which
+        # owns the real keys and rotates them on quota. In that mode the container
+        # only carries a placeholder - the proxy rewrites Authorization itself.
+        kiconnect_base_url = os.getenv("KICONNECT_BASE_URL", "https://chat.kiconnect.nrw/api/v1")
+        proxied = kiconnect_base_url != "https://chat.kiconnect.nrw/api/v1"
         kiconnect_api_key = os.getenv("KICONNECT_API_KEY", "")
         if not kiconnect_api_key:
-            raise RuntimeError("KICONNECT_API_KEY env var not set; required for kiconnect mode")
+            if not proxied:
+                raise RuntimeError("KICONNECT_API_KEY env var not set; required for kiconnect mode")
+            kiconnect_api_key = "proxy-managed"
 
         # LiteLLM requires the openai/ prefix to route this as a generic
         # OpenAI-compatible provider instead of trying to guess from the bare model name.
@@ -463,7 +472,7 @@ def get_llm_env(
             "LLM_MODEL": llm_model,
             "LLM_API_KEY": kiconnect_api_key,
             "OPENAI_API_KEY": kiconnect_api_key,
-            "OPENAI_BASE_URL": "https://chat.kiconnect.nrw/api/v1",
+            "OPENAI_BASE_URL": kiconnect_base_url,
             "LLM_DROP_PARAMS": "false",
         }
         return env, llm_model
