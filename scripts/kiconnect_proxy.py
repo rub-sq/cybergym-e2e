@@ -46,6 +46,133 @@ QUOTA_RE = re.compile("|".join(QUOTA_PATTERNS), re.IGNORECASE)
 CONCURRENCY_RE = re.compile("|".join(CONCURRENCY_PATTERNS), re.IGNORECASE)
 
 
+# Newer GPT-5.x models reject the legacy parameter name outright, and litellm
+# still sends it. Rewriting it here keeps OpenHands unmodified.
+RENAMED_PARAMS = {"max_tokens": "max_completion_tokens"}
+
+
+def adapt_chat_request(payload, model):
+    """Normalise a chat-completions body for the newer GPT-5.x parameter names."""
+    changed = False
+    for old_name, new_name in RENAMED_PARAMS.items():
+        if old_name in payload and new_name not in payload:
+            payload[new_name] = payload.pop(old_name)
+            changed = True
+    return payload, changed
+
+
+# --- /responses adapter -----------------------------------------------------
+# Some models (codex family) reject /chat/completions outright and only serve
+# POST /responses, which uses a different request AND response shape. litellm
+# and OpenHands only speak chat-completions, so the translation happens here.
+# Shapes below were taken from live responses on this endpoint, not from docs.
+RESPONSES_MODEL_RE = re.compile(r"codex", re.IGNORECASE)
+
+
+def needs_responses_api(model):
+    return bool(model) and bool(RESPONSES_MODEL_RE.search(model))
+
+
+def chat_to_responses(payload):
+    """Translate a chat-completions body into a /responses body."""
+    out = {"model": payload.get("model")}
+    items = []
+    for message in payload.get("messages", []):
+        role = message.get("role")
+        content = message.get("content")
+        if role == "tool":
+            # A tool result is its own item type keyed by the original call id.
+            items.append({
+                "type": "function_call_output",
+                "call_id": message.get("tool_call_id"),
+                "output": content if isinstance(content, str) else json.dumps(content),
+            })
+            continue
+        for call in message.get("tool_calls") or []:
+            fn = call.get("function", {})
+            items.append({
+                "type": "function_call",
+                "call_id": call.get("id"),
+                "name": fn.get("name"),
+                "arguments": fn.get("arguments", "{}"),
+            })
+        if content:
+            if not isinstance(content, str):
+                content = json.dumps(content)
+            items.append({"role": role, "content": content})
+    out["input"] = items
+
+    tools = []
+    for tool in payload.get("tools") or []:
+        fn = tool.get("function", tool)
+        # /responses wants the function fields flat, not nested under "function".
+        tools.append({
+            "type": "function",
+            "name": fn.get("name"),
+            "description": fn.get("description", ""),
+            "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+        })
+    if tools:
+        out["tools"] = tools
+    if payload.get("tool_choice") is not None:
+        out["tool_choice"] = payload["tool_choice"]
+
+    limit = payload.get("max_completion_tokens") or payload.get("max_tokens")
+    if limit:
+        out["max_output_tokens"] = limit
+    for passthrough in ("temperature", "top_p", "metadata"):
+        if payload.get(passthrough) is not None:
+            out[passthrough] = payload[passthrough]
+    return out
+
+
+def responses_to_chat(data, requested_model):
+    """Translate a /responses body back into a chat.completion body."""
+    text_parts = []
+    tool_calls = []
+    for item in data.get("output") or []:
+        kind = item.get("type")
+        if kind == "message":
+            for chunk in item.get("content") or []:
+                if chunk.get("type") in ("output_text", "text") and chunk.get("text"):
+                    text_parts.append(chunk["text"])
+        elif kind == "function_call":
+            tool_calls.append({
+                "id": item.get("call_id") or item.get("id"),
+                "type": "function",
+                "function": {
+                    "name": item.get("name"),
+                    "arguments": item.get("arguments", "{}"),
+                },
+            })
+        # "reasoning" items carry no user-visible content; intentionally dropped.
+
+    message = {"role": "assistant", "content": "".join(text_parts) or None}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    usage = data.get("usage") or {}
+    prompt_tokens = usage.get("input_tokens", 0)
+    completion_tokens = usage.get("output_tokens", 0)
+    return {
+        "id": data.get("id", ""),
+        "object": "chat.completion",
+        "created": data.get("created_at", int(time.time())),
+        "model": requested_model or data.get("model", ""),
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": "tool_calls" if tool_calls else "stop",
+            "logprobs": None,
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": usage.get("total_tokens", prompt_tokens + completion_tokens),
+        },
+    }
+
+
 def classify(status, body_text):
     """Return 'quota', 'concurrency', 'ok' or 'error' for an upstream response."""
     if 200 <= status < 300:
@@ -185,7 +312,13 @@ class Handler(BaseHTTPRequestHandler):
         self._proxy(self.rfile.read(length) if length else b"")
 
     def _proxy(self, body):
-        target = self.upstream.rstrip("/") + self.path.replace("/v1", "", 1)
+        suffix = self.path.replace("/v1", "", 1)
+        body, translate_back, requested_model = self._adapt_body(body)
+        if translate_back:
+            # chat-completions in, /responses out; the reply is converted back
+            # so the caller never sees the difference.
+            suffix = "/responses"
+        target = self.upstream.rstrip("/") + suffix
         for attempt in range(1, self.max_attempts + 1):
             try:
                 key = self.pool.acquire()
@@ -196,6 +329,12 @@ class Handler(BaseHTTPRequestHandler):
                 status, text, headers = self._forward(target, body, key)
             finally:
                 self.pool.release(key)
+
+            if translate_back and 200 <= status < 300:
+                try:
+                    text = json.dumps(responses_to_chat(json.loads(text), requested_model))
+                except Exception as exc:
+                    log(f"could not translate /responses reply: {exc}")
 
             verdict = classify(status, text)
             if verdict == "quota":
@@ -209,6 +348,35 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(status, text, headers)
             return
         self._fail(503, f"exhausted {self.max_attempts} attempts across key pool")
+
+    def _adapt_body(self, body):
+        """Normalise the outgoing body.
+
+        Returns (body, translate_response_back, requested_model).
+        """
+        if not body:
+            return body, False, None
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            return body, False, None
+        if not isinstance(payload, dict):
+            return body, False, None
+
+        model = payload.get("model", "")
+        is_chat = "chat/completions" in self.path
+
+        if is_chat and needs_responses_api(model):
+            payload.pop("stream", None)   # SSE is not emulated; force one-shot
+            converted = chat_to_responses(payload)
+            log(f"translating chat -> /responses for {model}")
+            return json.dumps(converted).encode("utf-8"), True, model
+
+        payload, changed = adapt_chat_request(payload, model)
+        if changed:
+            log(f"rewrote max_tokens -> max_completion_tokens for {model}")
+            return json.dumps(payload).encode("utf-8"), False, model
+        return body, False, model
 
     def _forward(self, target, body, key):
         req = urllib.request.Request(target, data=body or None, method=self.command)
