@@ -273,7 +273,10 @@ def run_claude_on_host(container_id, repo_to_patch, prompt, work_dir, model,
     Raises ClaudeQuotaExhausted (with a wake_at) or ClaudeAuthError so the caller
     can distinguish "come back later" from "stop, this needs a human".
     """
-    work_dir = Path(work_dir)
+    # Must be absolute: claude runs with cwd set to the exported repo, so any
+    # relative path here (--mcp-config, and the paths substituted into the
+    # prompt) would be resolved against that repo instead of the workspace.
+    work_dir = Path(work_dir).resolve()
     repo_dir = export_repo(container_id, repo_to_patch, work_dir)
     host_src_root = work_dir / "src"
     host_output = work_dir / "output"
@@ -304,7 +307,7 @@ def run_claude_on_host(container_id, repo_to_patch, prompt, work_dir, model,
     env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] = "1"
     env["DISABLE_AUTOUPDATER"] = "1"
 
-    log_path = Path(log_path) if log_path else (work_dir / "claude_output.txt")
+    log_path = Path(log_path).resolve() if log_path else (work_dir / "claude_output.txt")
     started = time.time()
     with open(log_path, "w", encoding="utf-8") as handle:
         proc = subprocess.Popen(
