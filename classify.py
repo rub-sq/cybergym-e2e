@@ -37,6 +37,33 @@ def load(p):
         return None
 
 
+SAFEGUARD_MARKERS = ("safeguards flagged this message", "Details: `[cyber]`",
+                     "Cyber Verification Program")
+
+
+def safeguard_flagged(run_dir):
+    """True when the CLI was stopped by Claude's real-time cyber safeguards.
+
+    These never reach the model, are not quota, and do not recover on retry -
+    the same task content is flagged every time. They belong in the results as
+    an explicit exclusion, not as an agent failure.
+    """
+    traj = os.path.join(run_dir, "trajectory")
+    if not os.path.isdir(traj):
+        return False
+    for name in os.listdir(traj):
+        if not name.endswith(".log"):
+            continue
+        try:
+            with open(os.path.join(traj, name), errors="replace") as fh:
+                text = fh.read(4000)
+        except OSError:
+            continue
+        if any(marker in text for marker in SAFEGUARD_MARKERS):
+            return True
+    return False
+
+
 def classify(s):
     atts = s.get("attempts") or [{}]
     last = atts[-1]
@@ -79,7 +106,11 @@ for base in dirs:
         if not summaries:
             env.append(task); reasons["killed_no_summary"] = reasons.get("killed_no_summary", 0) + 1
             continue
-        why = classify(summaries[-1])
+        latest_run = os.path.join(tdir, runs[-1]) if runs else None
+        if latest_run and safeguard_flagged(latest_run):
+            why = "safeguard_flagged(cyber)"
+        else:
+            why = classify(summaries[-1])
         if why:
             env.append(task); reasons[why] = reasons.get(why, 0) + 1
         else:
