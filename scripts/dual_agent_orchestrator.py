@@ -168,6 +168,7 @@ class Lane(threading.Thread):
         self.skipped = 0
         self.blocked_until = None
         self.crashed = False
+        self.pre_done = 0
 
     def run(self):
         try:
@@ -180,7 +181,13 @@ class Lane(threading.Thread):
 
     def _run_lane(self):
         total = len(self.tasks)
-        log(self.lane, f"lane started with {total} task(s)")
+        # Count what is already complete up front. Walking the list and
+        # counting skips as you go only tells you how far the cursor has
+        # moved, which on a resumed run reads as though nothing was done.
+        self.pre_done = sum(1 for t in self.tasks if already_done(t, self.output_dir))
+        log(self.lane,
+            f"lane started: {self.pre_done}/{total} already complete, "
+            f"{total - self.pre_done} to run")
         index = 0
         while index < len(self.tasks) and not STOP.is_set():
             task = self.tasks[index]
@@ -202,7 +209,9 @@ class Lane(threading.Thread):
                 continue          # same task again once the window reopens
             self.done += 1
             index += 1
-        log(self.lane, f"lane finished: {self.done} run, {self.skipped} skipped")
+        log(self.lane,
+            f"lane finished: {self.done} run this session, "
+            f"{self.pre_done + self.done}/{len(self.tasks)} complete overall")
 
     def _run_task(self, task, position, total):
         """Run one task. Returns a wake-up time if the lane must wait, else None."""
@@ -211,7 +220,7 @@ class Lane(threading.Thread):
         # `position` is the slot in the full task list, not a progress count -
         # a resumed lane starts near the top while most tasks are already done.
         # Report both so the log cannot be misread.
-        completed = self.skipped + self.done
+        completed = self.pre_done + self.done
         log(self.lane,
             f"[slot {position}/{total} | done {completed}] {task}  "
             f"(free {free_gb():.0f}G)")
