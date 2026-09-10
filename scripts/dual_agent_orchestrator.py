@@ -167,8 +167,18 @@ class Lane(threading.Thread):
         self.done = 0
         self.skipped = 0
         self.blocked_until = None
+        self.crashed = False
 
     def run(self):
+        try:
+            self._run_lane()
+        except Exception:
+            import traceback
+            log(self.lane, "LANE CRASHED - see traceback below")
+            traceback.print_exc()
+            self.crashed = True
+
+    def _run_lane(self):
         total = len(self.tasks)
         log(self.lane, f"lane started with {total} task(s)")
         index = 0
@@ -210,8 +220,14 @@ class Lane(threading.Thread):
             return None
         output = (proc.stdout or "") + (proc.stderr or "")
         if self.log_path:
-            with open(self.log_path, "a", encoding="utf-8") as fh:
-                fh.write(f"\n===== {task} =====\n{output}\n")
+            # A full disk must not kill the lane. This exact write raised
+            # ENOSPC once and silently took the OpenHands lane down for 35
+            # hours; losing a log line is always preferable to losing a lane.
+            try:
+                with open(self.log_path, "a", encoding="utf-8") as fh:
+                    fh.write(f"\n===== {task} =====\n{output}\n")
+            except OSError as exc:
+                log(self.lane, f"could not write task log ({exc}); continuing")
 
         if self.handles_claude_quota:
             match = QUOTA_MARKER.search(output)
@@ -352,7 +368,14 @@ def main():
     for lane in lanes:
         lane.start()
     try:
+        reported = set()
         while any(lane.is_alive() for lane in lanes):
+            for lane in lanes:
+                if not lane.is_alive() and lane.lane not in reported:
+                    reported.add(lane.lane)
+                    state = "crashed" if lane.crashed else "finished"
+                    log("main", f"*** lane '{lane.lane}' {state} "
+                                f"({lane.done} done) - other lanes continue ***")
             time.sleep(5)
     except KeyboardInterrupt:
         STOP.set()
