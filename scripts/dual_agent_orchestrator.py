@@ -208,7 +208,13 @@ class Lane(threading.Thread):
         """Run one task. Returns a wake-up time if the lane must wait, else None."""
         cmd = self.build_cmd(task)
         env = {**os.environ, **self.env}
-        log(self.lane, f"[{position}/{total}] {task}  (free {free_gb():.0f}G)")
+        # `position` is the slot in the full task list, not a progress count -
+        # a resumed lane starts near the top while most tasks are already done.
+        # Report both so the log cannot be misread.
+        completed = self.skipped + self.done
+        log(self.lane,
+            f"[slot {position}/{total} | done {completed}] {task}  "
+            f"(free {free_gb():.0f}G)")
         started = time.time()
         try:
             proc = subprocess.run(
