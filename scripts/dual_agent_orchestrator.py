@@ -138,6 +138,35 @@ def latest_summary(task, output_dir):
     return None
 
 
+SAFEGUARD_MARKERS = ("safeguards flagged this message", "Details: `[cyber]`")
+
+
+def safeguard_flagged(task, output_dir):
+    """True when the last run was stopped by real-time cyber safeguards.
+
+    Measured at ~50% on identical input, so this is probabilistic rather than a
+    property of the task: a flagged run tells us nothing about the model and
+    must be retried, not recorded as a failure.
+    """
+    tdir = Path(output_dir) / task.replace("/", "_")
+    if not tdir.is_dir():
+        return False
+    runs = sorted(p for p in tdir.iterdir() if p.is_dir())
+    if not runs:
+        return False
+    traj = runs[-1] / "trajectory"
+    if not traj.is_dir():
+        return False
+    for log_file in traj.glob("*.log"):
+        try:
+            text = log_file.read_text(errors="replace")[:4000]
+        except OSError:
+            continue
+        if any(marker in text for marker in SAFEGUARD_MARKERS):
+            return True
+    return False
+
+
 def already_done(task, output_dir):
     """A task counts as done on success, or on a failure that got a fair run."""
     data = latest_summary(task, output_dir)
@@ -145,6 +174,8 @@ def already_done(task, output_dir):
         return False
     if str(data.get("status", "")).upper() == "SUCCESS":
         return True
+    if safeguard_flagged(task, output_dir):
+        return False   # never reached the model; retry it
     return data.get("duration_seconds", 0) >= 60
 
 
@@ -169,6 +200,7 @@ class Lane(threading.Thread):
         self.blocked_until = None
         self.crashed = False
         self.pre_done = 0
+        self.max_safeguard_retries = int(os.getenv("SAFEGUARD_RETRIES", "3"))
 
     def run(self):
         try:
@@ -189,6 +221,7 @@ class Lane(threading.Thread):
             f"lane started: {self.pre_done}/{total} already complete, "
             f"{total - self.pre_done} to run")
         index = 0
+        attempts_here = 0          # safeguard retries spent on self.tasks[index]
         while index < len(self.tasks) and not STOP.is_set():
             task = self.tasks[index]
             if already_done(task, self.output_dir):
@@ -207,6 +240,15 @@ class Lane(threading.Thread):
             if wake_at:
                 self._sleep_until(wake_at, task)
                 continue          # same task again once the window reopens
+            if (self.handles_claude_quota
+                    and safeguard_flagged(task, self.output_dir)
+                    and attempts_here < self.max_safeguard_retries):
+                attempts_here += 1
+                log(self.lane,
+                    f"    {task} flagged by safeguards; retry "
+                    f"{attempts_here}/{self.max_safeguard_retries}")
+                continue
+            attempts_here = 0
             self.done += 1
             index += 1
         log(self.lane,
