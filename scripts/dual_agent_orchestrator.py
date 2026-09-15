@@ -31,7 +31,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).parent.absolute()
@@ -201,6 +201,7 @@ class Lane(threading.Thread):
         self.crashed = False
         self.pre_done = 0
         self.max_safeguard_retries = int(os.getenv("SAFEGUARD_RETRIES", "3"))
+        self.max_quota_sleeps = int(os.getenv("MAX_QUOTA_SLEEPS", "5"))
 
     def run(self):
         try:
@@ -222,6 +223,7 @@ class Lane(threading.Thread):
             f"{total - self.pre_done} to run")
         index = 0
         attempts_here = 0          # safeguard retries spent on self.tasks[index]
+        quota_sleeps = 0           # consecutive quota waits on self.tasks[index]
         while index < len(self.tasks) and not STOP.is_set():
             task = self.tasks[index]
             if already_done(task, self.output_dir):
@@ -238,8 +240,22 @@ class Lane(threading.Thread):
                 # (it waits for active==0) and deadlock the other lane.
                 self.gate.release()
             if wake_at:
-                self._sleep_until(wake_at, task)
+                quota_sleeps += 1
+                if quota_sleeps > self.max_quota_sleeps:
+                    # The reported wake-up time is a guess when the message
+                    # carries no explicit reset, so a task whose quota never
+                    # clears would otherwise retry at a fixed interval forever.
+                    log(self.lane,
+                        f"    {task} still quota-blocked after "
+                        f"{self.max_quota_sleeps} waits; moving on")
+                    quota_sleeps = 0
+                    attempts_here = 0
+                    self.done += 1
+                    index += 1
+                    continue
+                self._sleep_until(wake_at, task, escalate=quota_sleeps)
                 continue          # same task again once the window reopens
+            quota_sleeps = 0
             if (self.handles_claude_quota
                     and safeguard_flagged(task, self.output_dir)
                     and attempts_here < self.max_safeguard_retries):
@@ -300,13 +316,21 @@ class Lane(threading.Thread):
         log(self.lane, f"    {task} -> {verdict} in {mins:.1f}m")
         return None
 
-    def _sleep_until(self, iso_time, task):
+    def _sleep_until(self, iso_time, task, escalate=1):
         try:
             wake = datetime.fromisoformat(iso_time)
         except ValueError:
             wake = datetime.now(timezone.utc)
         if wake.tzinfo is None:
             wake = wake.replace(tzinfo=timezone.utc)
+        # Back off harder each consecutive time the same task is blocked. The
+        # subprocess reports attempt=1 every run, so its own escalation never
+        # kicks in and repeated waits would all be the same short guess.
+        if escalate > 1:
+            floor = datetime.now(timezone.utc) + timedelta(
+                seconds=min(1800 * (2 ** (escalate - 1)), 18000))
+            if floor > wake:
+                wake = floor
         self.blocked_until = wake
         while not STOP.is_set():
             remaining = (wake - datetime.now(timezone.utc)).total_seconds()
