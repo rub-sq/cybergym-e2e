@@ -37,6 +37,13 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).parent.absolute()
 REPO_ROOT = SCRIPTS_DIR.parent
 IMAGE_PREFIXES = r"^(cybergym/|n132/arvo|gcr\.io/oss-fuzz-base)"
+# Matching on the image name alone misses containers whose image was pulled by
+# digest: `docker ps` then reports .Image as a bare ID (fba1033c6a64) and no
+# prefix matches. Those orphans survived every cleanup for over a week and
+# pinned their base images so nothing could be reclaimed. run_agent.py names
+# containers "<agent>-<uuid>", which we control, so match that too.
+NAME_PREFIXES = ("openhands-", "claude-code-host-", "claude-code-",
+                 "codex-", "gemini-cli-")
 STOP = threading.Event()
 
 
@@ -54,14 +61,17 @@ def docker_cleanup():
     """Remove our orphaned containers and idle images. Never a blanket prune."""
     try:
         listing = subprocess.run(
-            ["docker", "ps", "-a", "--format", "{{.ID}} {{.Image}}"],
+            ["docker", "ps", "-a", "--format", "{{.ID}}\t{{.Image}}\t{{.Names}}"],
             capture_output=True, text=True, timeout=120,
         ).stdout.splitlines()
-        ours = [
-            line.split()[0]
-            for line in listing
-            if len(line.split()) > 1 and re.match(IMAGE_PREFIXES, line.split()[1])
-        ]
+        ours = []
+        for line in listing:
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            cid, image, name = parts[0], parts[1], parts[2]
+            if re.match(IMAGE_PREFIXES, image) or name.startswith(NAME_PREFIXES):
+                ours.append(cid)
         if ours:
             log("cleanup", f"removing {len(ours)} container(s)")
             subprocess.run(["docker", "rm", "-f", *ours],
