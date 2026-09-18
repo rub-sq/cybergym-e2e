@@ -32,7 +32,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 KICONNECT_KEY1="${1:-${KICONNECT_KEY1:-}}"
 KICONNECT_KEY2="${2:-${KICONNECT_KEY2:-}}"
-OPENHANDS_MODEL="${OPENHANDS_MODEL:-openai-gpt-oss-120b}"
+# Comma-separated: one lane per model. KIConnect meters limits per model,
+# so e.g. a slow codex lane and a fast nano lane do not block each other.
+OPENHANDS_MODELS="${OPENHANDS_MODELS:-${OPENHANDS_MODEL:-openai-gpt-oss-120b}}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-sonnet}"
 MIN_FREE_GB="${MIN_FREE_GB:-50}"
 TASKS="${TASKS:-tasks_920.txt}"
@@ -91,9 +93,13 @@ if [[ "$want_claude" == "1" ]]; then
 fi
 
 ORCH_ARGS=(--tasks "$TASKS" --min-free-gb "$MIN_FREE_GB" --log-dir "$LOG_DIR")
-[[ "$want_openhands" == "1" ]] && ORCH_ARGS+=(--openhands
-    --openhands-model "$OPENHANDS_MODEL"
-    --proxy-url "http://host.docker.internal:$PROXY_PORT/v1")
+if [[ "$want_openhands" == "1" ]]; then
+    ORCH_ARGS+=(--openhands --proxy-url "http://host.docker.internal:$PROXY_PORT/v1")
+    IFS=',' read -ra _models <<< "$OPENHANDS_MODELS"
+    for _m in "${_models[@]}"; do
+        ORCH_ARGS+=(--openhands-model "$(echo "$_m" | xargs)")
+    done
+fi
 [[ "$want_claude" == "1" ]] && ORCH_ARGS+=(--claude --claude-model "$CLAUDE_MODEL")
 
 echo ""

@@ -192,10 +192,19 @@ def classify(status, body_text):
 
 
 class KeyPool:
+    """Pools API keys, locking them per (key, model).
+
+    KIConnect meters message limits per model - nano allows 100/hour while
+    codex allows 30/2h - so exhausting one model on a key says nothing about
+    the others. Locking the whole key would idle it needlessly. The concurrency
+    cap is different: that one is account-wide, so in-flight counts stay
+    per-key.
+    """
+
     def __init__(self, keys, lock_seconds, state_file, max_concurrent=3):
         self._lock = threading.Condition()
         self._keys = list(keys)
-        self._locked_until = {k: 0.0 for k in self._keys}
+        self._locked_until = {}            # (key, model) -> unix ts
         self._inflight = {k: 0 for k in self._keys}
         self._lock_seconds = lock_seconds
         self._state_file = state_file
@@ -211,12 +220,14 @@ class KeyPool:
         try:
             with open(self._state_file) as fh:
                 saved = json.load(fh)
-            for key in self._keys:
-                until = saved.get(self._label(key))
-                if until and until > time.time():
-                    self._locked_until[key] = until
-                    left = int(until - time.time())
-                    log(f"restored lock on {self._label(key)} ({left}s remaining)")
+            by_label = {self._label(k): k for k in self._keys}
+            for entry, until in saved.items():
+                label, _, model = entry.partition("|")
+                key = by_label.get(label)
+                if key and until > time.time():
+                    self._locked_until[(key, model)] = until
+                    log(f"restored lock on {label}/{model or '*'} "
+                        f"({int(until - time.time())}s remaining)")
         except Exception as exc:
             log(f"could not read state file: {exc}")
 
@@ -227,14 +238,15 @@ class KeyPool:
             tmp = self._state_file + ".tmp"
             with open(tmp, "w") as fh:
                 json.dump(
-                    {self._label(k): v for k, v in self._locked_until.items()}, fh
+                    {f"{self._label(k)}|{m}": v
+                     for (k, m), v in self._locked_until.items()}, fh
                 )
             os.replace(tmp, self._state_file)
         except Exception as exc:
             log(f"could not write state file: {exc}")
 
-    def acquire(self, timeout=None):
-        """Block until a key is free, then reserve a concurrency slot on it."""
+    def acquire(self, model="", timeout=None):
+        """Block until a key is usable for `model`, then reserve a slot on it."""
         deadline = None if timeout is None else time.time() + timeout
         with self._lock:
             while True:
@@ -242,7 +254,7 @@ class KeyPool:
                 candidates = [
                     k
                     for k in self._keys
-                    if self._locked_until[k] <= now
+                    if self._locked_until.get((k, model), 0.0) <= now
                     and self._inflight[k] < self._max_concurrent
                 ]
                 if candidates:
@@ -251,13 +263,13 @@ class KeyPool:
                     self._inflight[key] += 1
                     return key
                 waits = [
-                    self._locked_until[k] - now
+                    self._locked_until[(k, model)] - now
                     for k in self._keys
-                    if self._locked_until[k] > now
+                    if self._locked_until.get((k, model), 0.0) > now
                 ]
                 if len(waits) == len(self._keys):
-                    soonest = int(min(waits))
-                    log(f"all {len(self._keys)} keys locked; soonest frees in {soonest}s")
+                    log(f"all {len(self._keys)} keys locked for {model}; "
+                        f"soonest frees in {int(min(waits))}s")
                 remaining = None if deadline is None else deadline - time.time()
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError("no key became available in time")
@@ -268,23 +280,27 @@ class KeyPool:
             self._inflight[key] = max(0, self._inflight[key] - 1)
             self._lock.notify_all()
 
-    def lock_out(self, key):
+    def lock_out(self, key, model=""):
         with self._lock:
-            self._locked_until[key] = time.time() + self._lock_seconds
+            self._locked_until[(key, model)] = time.time() + self._lock_seconds
             self._save()
-            log(f"LOCKED {self._label(key)} for {self._lock_seconds}s (quota exhausted)")
+            log(f"LOCKED {self._label(key)} for model {model or '*'} "
+                f"({self._lock_seconds}s, quota exhausted)")
             self._lock.notify_all()
 
     def status(self):
         now = time.time()
         with self._lock:
-            return {
-                self._label(k): {
-                    "locked_for": max(0, int(self._locked_until[k] - now)),
-                    "inflight": self._inflight[k],
+            out = {}
+            for k in self._keys:
+                locks = {
+                    m: max(0, int(t - now))
+                    for (kk, m), t in self._locked_until.items()
+                    if kk is k and t > now
                 }
-                for k in self._keys
-            }
+                out[self._label(k)] = {"inflight": self._inflight[k],
+                                       "locked": locks}
+            return out
 
 
 def log(msg):
@@ -324,7 +340,7 @@ class Handler(BaseHTTPRequestHandler):
         target = self.upstream.rstrip("/") + suffix
         for attempt in range(1, self.max_attempts + 1):
             try:
-                key = self.pool.acquire()
+                key = self.pool.acquire(model=requested_model or "")
             except TimeoutError:
                 self._fail(503, "no key available")
                 return
@@ -341,7 +357,7 @@ class Handler(BaseHTTPRequestHandler):
 
             verdict = classify(status, text)
             if verdict == "quota":
-                self.pool.lock_out(key)
+                self.pool.lock_out(key, requested_model or "")
                 continue                       # straight to another key
             if verdict == "concurrency":
                 wait = min(30, 2 ** min(attempt, 4))

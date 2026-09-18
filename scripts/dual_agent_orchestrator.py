@@ -399,10 +399,13 @@ def main():
     ap.add_argument("--max-attempts", type=int, default=2)
     ap.add_argument("--log-dir", default="parallel_logs_dual")
 
-    ap.add_argument("--openhands", action="store_true", help="enable the OpenHands lane")
-    ap.add_argument("--openhands-model", default="openai-gpt-oss-120b",
-                    help="KIConnect model id (discover with the /models endpoint)")
-    ap.add_argument("--openhands-output", default="agent_output_openhands_codex")
+    ap.add_argument("--openhands", action="store_true", help="enable the OpenHands lane(s)")
+    ap.add_argument("--openhands-model", action="append", default=[],
+                    help="KIConnect model id; repeat for one lane per model. "
+                         "Limits are metered per model, so lanes on different "
+                         "models do not block each other.")
+    ap.add_argument("--openhands-output", default=None,
+                    help="output dir; only valid with a single --openhands-model")
     ap.add_argument("--proxy-url", default="http://host.docker.internal:8817/v1",
                     help="URL of kiconnect_proxy.py AS SEEN FROM INSIDE THE CONTAINER")
 
@@ -429,22 +432,33 @@ def main():
     print("=" * 68)
     print(f"  tasks           : {len(tasks)} from {args.tasks}")
     print(f"  disk threshold  : {args.min_free_gb:.0f}G (currently {free_gb():.0f}G free)")
-    print(f"  lanes           : "
-          f"{'openhands ' if args.openhands else ''}{'claude' if args.claude else ''}")
+    lane_desc = []
+    if args.openhands:
+        lane_desc += [f"openhands({m})" for m in (args.openhands_model or ["gpt-oss"])]
+    if args.claude:
+        lane_desc.append(f"claude({args.claude_model})")
+    print(f"  lanes           : {', '.join(lane_desc)}")
     print("=" * 68)
 
     lanes = []
     if args.openhands:
-        Path(args.openhands_output).mkdir(parents=True, exist_ok=True)
-        lanes.append(Lane(
-            "openhands", tasks, args.openhands_output,
-            openhands_cmd_factory(args.openhands_model, args.openhands_output,
-                                  args.max_attempts, args.timeout),
-            gate,
-            env={"KICONNECT_BASE_URL": args.proxy_url,
-                 "KICONNECT_API_KEY": os.getenv("KICONNECT_API_KEY", "proxy-managed")},
-            log_path=str(log_dir / "openhands.log"),
-        ))
+        models = args.openhands_model or ["openai-gpt-oss-120b"]
+        if args.openhands_output and len(models) > 1:
+            ap.error("--openhands-output cannot be used with several models")
+        for model in models:
+            # A short, filesystem-safe tag so each model keeps its own results.
+            tag = re.sub(r"[^A-Za-z0-9]+", "_", model).strip("_")[:40]
+            out = args.openhands_output or f"agent_output_openhands_{tag}"
+            Path(out).mkdir(parents=True, exist_ok=True)
+            name = "openhands" if len(models) == 1 else f"oh:{tag[:12]}"
+            lanes.append(Lane(
+                name, tasks, out,
+                openhands_cmd_factory(model, out, args.max_attempts, args.timeout),
+                gate,
+                env={"KICONNECT_BASE_URL": args.proxy_url,
+                     "KICONNECT_API_KEY": os.getenv("KICONNECT_API_KEY", "proxy-managed")},
+                log_path=str(log_dir / f"{name.replace(':', '_')}.log"),
+            ))
     if args.claude:
         Path(args.claude_output).mkdir(parents=True, exist_ok=True)
         lanes.append(Lane(
