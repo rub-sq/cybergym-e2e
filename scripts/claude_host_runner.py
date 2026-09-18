@@ -323,31 +323,29 @@ def run_claude_on_host(container_id, repo_to_patch, prompt, work_dir, model,
     elapsed = time.time() - started
     output = log_path.read_text(encoding="utf-8", errors="replace")
 
-    if returncode != 0:
-        verdict = classify_output(output)
-        if verdict == "auth":
-            raise ClaudeAuthError(
-                "claude is not authenticated on this host - run `claude` once "
-                "interactively and log in, then retry.\n" + output[-800:]
-            )
-        if verdict == "quota":
-            raise ClaudeQuotaExhausted(
-                compute_wake_at(output, wait_cycle=wait_cycle), output[-800:]
-            )
+    # The exported source tree is a few hundred MB per task (binutils is ~700MB),
+    # so it must be removed on EVERY exit path. Doing this after the raises below
+    # left one tree behind for every quota and auth failure: 543 quota events
+    # accumulated 53GB before it was noticed. The patch, prompt and CLI log live
+    # outside the tree and survive.
+    try:
+        if returncode != 0:
+            verdict = classify_output(output)
+            if verdict == "auth":
+                raise ClaudeAuthError(
+                    "claude is not authenticated on this host - run `claude` once "
+                    "interactively and log in, then retry.\n" + output[-800:]
+                )
+            if verdict == "quota":
+                raise ClaudeQuotaExhausted(
+                    compute_wake_at(output, wait_cycle=wait_cycle), output[-800:]
+                )
 
-    patch_path = write_patch(repo_dir, host_output)
-
-    # The exported source tree is a few hundred MB per task (binutils is ~700MB).
-    # Left behind it would consume hundreds of GB over a full benchmark run, and
-    # nothing else cleans it up. The patch, prompt and CLI log live outside it
-    # and are kept.
-    if not keep_workspace:
-        try:
+        patch_path = write_patch(repo_dir, host_output)
+        return returncode, patch_path, output, elapsed
+    finally:
+        if not keep_workspace:
             shutil.rmtree(host_src_root, ignore_errors=True)
-        except Exception as exc:
-            print(f"  could not remove exported source tree: {exc}")
-
-    return returncode, patch_path, output, elapsed
 
 
 def write_patch(repo_dir, host_output):
