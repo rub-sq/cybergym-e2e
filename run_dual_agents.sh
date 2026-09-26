@@ -1,22 +1,28 @@
 #!/bin/bash
-# Launch the long-running dual-agent benchmark.
+# Launch the long-running multi-agent benchmark.
 #
-#   lane 1  OpenHands -> KIConnect, through a key-rotating proxy
-#   lane 2  Claude Code -> the host's logged-in CLI (subscription auth)
+#   lanes   OpenHands   -> KIConnect, through a key-rotating proxy
+#           Claude Code -> the host's logged-in CLI (subscription auth)
+#           opencode    -> the host's opencode CLI, also through the proxy
 #
-# Both lanes run one task at a time and block independently: OpenHands waiting
-# on KIConnect quota does not stall Claude, and Claude waiting out a 5-hour or
-# weekly limit does not stall OpenHands. Disk is the only shared resource, and
-# the orchestrator drains + cleans whenever free space drops below the floor.
+# Every lane runs one task at a time and blocks independently: OpenHands or
+# opencode waiting on KIConnect quota does not stall Claude, and Claude
+# waiting out a 5-hour or weekly limit does not stall the rest. Disk is the
+# only shared resource, and the orchestrator drains + cleans whenever free
+# space drops below the floor.
 #
 # Usage:
-#   ./run_dual_agents.sh                 both lanes
-#   LANES=claude ./run_dual_agents.sh    one lane only
+#   ./run_dual_agents.sh                          both lanes
+#   LANES=claude ./run_dual_agents.sh             one lane only
+#   LANES=openhands-opencode ./run_dual_agents.sh the two kiconnect lanes
 #
 # Config via environment or .env:
 #   KICONNECT_KEY1 / KICONNECT_KEY2   keys pooled by the proxy
 #   OPENHANDS_MODEL                   KIConnect model id (see below)
 #   CLAUDE_MODEL                      default: sonnet
+#   OPENCODE_MODELS                   comma-separated kiconnect model ids for
+#                                     opencode lanes (default: qwen-qwen3-8-27b);
+#                                     requires the `opencode` CLI on PATH
 #   MIN_FREE_GB                       default: 50
 #   TASKS                             default: tasks_920.txt
 #
@@ -36,6 +42,7 @@ KICONNECT_KEY2="${2:-${KICONNECT_KEY2:-}}"
 # so e.g. a slow codex lane and a fast nano lane do not block each other.
 OPENHANDS_MODELS="${OPENHANDS_MODELS:-${OPENHANDS_MODEL:-openai-gpt-oss-120b}}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-sonnet}"
+OPENCODE_MODELS="${OPENCODE_MODELS:-qwen-qwen3-8-27b}"
 MIN_FREE_GB="${MIN_FREE_GB:-50}"
 TASKS="${TASKS:-tasks_920.txt}"
 PROXY_PORT="${PROXY_PORT:-8817}"
@@ -45,12 +52,14 @@ LOG_DIR="${LOG_DIR:-parallel_logs_dual}"
 
 mkdir -p "$LOG_DIR"
 
-want_openhands=0; want_claude=0
+want_openhands=0; want_claude=0; want_opencode=0
 case "$LANES" in
-    both)      want_openhands=1; want_claude=1 ;;
-    openhands) want_openhands=1 ;;
-    claude)    want_claude=1 ;;
-    *) echo "LANES must be both|openhands|claude"; exit 1 ;;
+    both)           want_openhands=1; want_claude=1 ;;
+    openhands)      want_openhands=1 ;;
+    claude)         want_claude=1 ;;
+    opencode)       want_opencode=1 ;;
+    openhands-opencode) want_openhands=1; want_opencode=1 ;;
+    *) echo "LANES must be both|openhands|claude|opencode|openhands-opencode"; exit 1 ;;
 esac
 
 PROXY_PID=""
@@ -61,9 +70,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if [[ "$want_openhands" == "1" ]]; then
+# The KIConnect proxy serves both the OpenHands and the opencode lanes.
+want_proxy=0
+[[ "$want_openhands" == "1" ]] && want_proxy=1
+[[ "$want_opencode" == "1" ]] && want_proxy=1
+
+if [[ "$want_proxy" == "1" ]]; then
     if [[ -z "$KICONNECT_KEY1" ]]; then
-        echo "ERROR: OpenHands lane needs KICONNECT_KEY1 (and ideally KICONNECT_KEY2)"
+        echo "ERROR: KIConnect lanes need KICONNECT_KEY1 (and ideally KICONNECT_KEY2)"
         echo "Pass them as arguments or set them in .env"
         exit 1
     fi
@@ -92,6 +106,13 @@ if [[ "$want_claude" == "1" ]]; then
     echo "claude CLI: $(claude --version 2>&1 | head -1)"
 fi
 
+if [[ "$want_opencode" == "1" ]]; then
+    if ! command -v opencode > /dev/null; then
+        echo "ERROR: opencode CLI not found on PATH (install: curl -fsSL https://opencode.ai/install | bash)"; exit 1
+    fi
+    echo "opencode CLI: $(opencode --version 2>&1 | head -1)"
+fi
+
 ORCH_ARGS=(--tasks "$TASKS" --min-free-gb "$MIN_FREE_GB" --log-dir "$LOG_DIR")
 if [[ "$want_openhands" == "1" ]]; then
     ORCH_ARGS+=(--openhands --proxy-url "http://host.docker.internal:$PROXY_PORT/v1")
@@ -101,6 +122,13 @@ if [[ "$want_openhands" == "1" ]]; then
     done
 fi
 [[ "$want_claude" == "1" ]] && ORCH_ARGS+=(--claude --claude-model "$CLAUDE_MODEL")
+if [[ "$want_opencode" == "1" ]]; then
+    ORCH_ARGS+=(--opencode --proxy-url "http://host.docker.internal:$PROXY_PORT/v1")
+    IFS=',' read -ra _models <<< "$OPENCODE_MODELS"
+    for _m in "${_models[@]}"; do
+        ORCH_ARGS+=(--opencode-model "$(echo "$_m" | xargs)")
+    done
+fi
 
 echo ""
 python3 scripts/dual_agent_orchestrator.py "${ORCH_ARGS[@]}"

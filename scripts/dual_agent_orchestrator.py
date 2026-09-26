@@ -43,7 +43,7 @@ IMAGE_PREFIXES = r"^(cybergym/|n132/arvo|gcr\.io/oss-fuzz-base)"
 # pinned their base images so nothing could be reclaimed. run_agent.py names
 # containers "<agent>-<uuid>", which we control, so match that too.
 NAME_PREFIXES = ("openhands-", "claude-code-host-", "claude-code-",
-                 "codex-", "gemini-cli-")
+                 "codex-", "gemini-cli-", "opencode-")
 STOP = threading.Event()
 
 
@@ -386,6 +386,26 @@ def claude_cmd_factory(model, output_dir, attempts, timeout):
     return build
 
 
+def opencode_cmd_factory(model, output_dir, attempts, timeout):
+    """One lane per kiconnect model id, driven through the host's opencode CLI.
+
+    The lanes share KIConnect's pooled keys via the proxy, so they block on
+    quota together - one lane per model keeps the per-model meters separate.
+    """
+    def build(task):
+        return [
+            sys.executable, str(SCRIPTS_DIR / "run_agent.py"), task,
+            "--agent", "opencode",
+            "--prompt-style", "no-test",
+            "--mode", "patch-only",
+            "--max-attempts", str(attempts),
+            "--timeout", str(timeout),
+            "--opencode-model", model,
+            "--agent-output", output_dir,
+        ]
+    return build
+
+
 def read_tasks(path):
     return [ln.strip() for ln in Path(path).read_text().splitlines() if ln.strip()]
 
@@ -412,10 +432,16 @@ def main():
     ap.add_argument("--claude", action="store_true", help="enable the Claude Code lane")
     ap.add_argument("--claude-model", default="sonnet")
     ap.add_argument("--claude-output", default="agent_output_claude_host")
+
+    ap.add_argument("--opencode", action="store_true", help="enable the opencode (kiconnect) lane(s)")
+    ap.add_argument("--opencode-model", action="append", default=[],
+                    help="kiconnect model id for opencode; repeat for one lane per model")
+    ap.add_argument("--opencode-output", default=None,
+                    help="output dir; only valid with a single --opencode-model")
     args = ap.parse_args()
 
-    if not args.openhands and not args.claude:
-        ap.error("enable at least one lane: --openhands and/or --claude")
+    if not args.openhands and not args.claude and not args.opencode:
+        ap.error("enable at least one lane: --openhands, --claude and/or --opencode")
 
     tasks = read_tasks(args.tasks)
     log_dir = Path(args.log_dir)
@@ -437,6 +463,8 @@ def main():
         lane_desc += [f"openhands({m})" for m in (args.openhands_model or ["gpt-oss"])]
     if args.claude:
         lane_desc.append(f"claude({args.claude_model})")
+    if args.opencode:
+        lane_desc += [f"opencode({m})" for m in (args.opencode_model or ["qwen"])]
     print(f"  lanes           : {', '.join(lane_desc)}")
     print("=" * 68)
 
@@ -469,6 +497,24 @@ def main():
             log_path=str(log_dir / "claude.log"),
             handles_claude_quota=True,
         ))
+    if args.opencode:
+        models = args.opencode_model or ["qwen-qwen3-8-27b"]
+        if args.opencode_output and len(models) > 1:
+            ap.error("--opencode-output cannot be used with several models")
+        for model in models:
+            tag = re.sub(r"[^A-Za-z0-9]+", "_", model).strip("_")[:40]
+            out = args.opencode_output or f"agent_output_opencode_{tag}"
+            Path(out).mkdir(parents=True, exist_ok=True)
+            name = "opencode" if len(models) == 1 else f"oc:{tag[:12]}"
+            lanes.append(Lane(
+                name, tasks, out,
+                opencode_cmd_factory(model, out, args.max_attempts, args.timeout),
+                gate,
+                env={"KICONNECT_BASE_URL": args.proxy_url,
+                     "KICONNECT_API_KEY": os.getenv("KICONNECT_API_KEY", "proxy-managed")},
+                log_path=str(log_dir / f"{name.replace(':', '_')}.log"),
+                handles_claude_quota=True,
+            ))
 
     for lane in lanes:
         lane.start()

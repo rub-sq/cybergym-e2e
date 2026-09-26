@@ -39,6 +39,7 @@ import tempfile
 from pathlib import Path
 
 import claude_host_runner
+import opencode_host_runner
 
 import tomli
 
@@ -806,9 +807,9 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
         # Setup workspace (don't copy ground truth PoC - agent shouldn't see it)
         setup_workspace(container_id, data_path, script_path, args.mode, copy_gt_poc=False, scripts_dir=scripts_dir)
 
-        # Install agent. claude-code-host drives the host's own logged-in CLI,
-        # so nothing needs installing inside the container.
-        if args.agent != "claude-code-host":
+        # Install agent. The *-host agents drive CLIs on the host machine, so
+        # nothing needs installing inside the container.
+        if args.agent not in ("claude-code-host", "opencode"):
             install(container_id, args.agent, scripts_dir=scripts_dir)
 
         # Execute agent
@@ -822,6 +823,17 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
                 prompt=prompt,
                 work_dir=work_dir / "host_workspace",
                 model=args.claude_host_model,
+                timeout=args.timeout,
+                wait_cycle=attempt,
+                log_path=str(log_file),
+            )
+        elif args.agent == "opencode":
+            exit_code, host_patch, _out, _el = opencode_host_runner.run_opencode_on_host(
+                container_id=container_id,
+                repo_to_patch=config.get("repo_to_patch"),
+                prompt=prompt,
+                work_dir=work_dir / "host_workspace",
+                model=args.opencode_model,
                 timeout=args.timeout,
                 wait_cycle=attempt,
                 log_path=str(log_file),
@@ -849,7 +861,7 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
             ["docker", "cp", f"{container_id}:/output/poc.bin", str(local_output / "poc.bin")],
             capture_output=True
         )
-        if args.agent == "claude-code-host":
+        if args.agent in ("claude-code-host", "opencode"):
             if host_patch and Path(host_patch).is_file():
                 shutil.copy(str(host_patch), str(local_output / "fix.patch"))
         else:
@@ -871,6 +883,15 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
         return 125, None, None, None, container_id, 0
     except claude_host_runner.ClaudeAuthError as e:
         print(f"CLAUDE_AUTH_ERROR {e}")
+        return 126, None, None, None, container_id, 0
+    except opencode_host_runner.OpencodeQuotaExhausted as e:
+        # Same marker the claude lane uses: the orchestrator's QUOTA_MARKER
+        # picks it up and sleeps until the proxy pool frees a key.
+        print(f"CLAUDE_QUOTA_EXHAUSTED wake_at={e.wake_at.isoformat()}")
+        print(f"  opencode/kiconnect quota exhausted; resume at {e.wake_at.isoformat()}")
+        return 125, None, None, None, container_id, 0
+    except opencode_host_runner.OpencodeAuthError as e:
+        print(f"OPENCODE_AUTH_ERROR {e}")
         return 126, None, None, None, container_id, 0
     except Exception as e:
         print(f"  Agent execution error: {e}")
@@ -1067,7 +1088,7 @@ Examples:
     parser.add_argument("task_path", help="Task path (e.g., curl/arvo_66012)")
 
     # Agent selection
-    parser.add_argument("--agent", choices=["claude-code", "claude-code-host", "openhands", "codex", "gemini-cli"], default="claude-code",
+    parser.add_argument("--agent", choices=["claude-code", "claude-code-host", "openhands", "codex", "gemini-cli", "opencode"], default="claude-code",
                         help="Agent backend to use (default: claude-code)")
     parser.add_argument("--prompt-style", choices=["iterative", "no-test"], default="iterative",
                         help="Prompt style: iterative (can test) or no-test (default: iterative)")
@@ -1097,6 +1118,9 @@ Examples:
                         help="Model ID used with --model-provider anthropic (reads ANTHROPIC_API_KEY from env)")
     parser.add_argument("--claude-host-model", default="sonnet",
                         help="Model for --agent claude-code-host (host CLI, subscription auth)")
+    parser.add_argument("--opencode-model", default="qwen-qwen3-8-27b",
+                        help="Model for --agent opencode (kiconnect model id; reads KICONNECT_API_KEY "
+                             "from env, or use KICONNECT_BASE_URL to point at the key-rotating proxy)")
     parser.add_argument("--kiconnect-model-id", default="openai-gpt-oss-120b",
                         help="Model ID used with --model-provider kiconnect (reads KICONNECT_API_KEY from env)")
     parser.add_argument("--aws-region", default="us-west-2")
@@ -1131,21 +1155,23 @@ Examples:
         if os.getenv("LITELLM_BASE_URL"):
             os.environ["GOOGLE_GEMINI_BASE_URL"] = os.getenv("LITELLM_BASE_URL")
 
-    _, llm_model = get_llm_env(
-        model_provider=args.model_provider,
-        litellm_model_id=args.litellm_model_id,
-        bedrock_model_id=args.bedrock_model_id,
-        anthropic_model_id=args.anthropic_model_id,
-        kiconnect_model_id=args.kiconnect_model_id,
-        aws_region=args.aws_region,
-        aws_profile=args.aws_profile,
-    )
-
-    # claude-code-host drives the host CLI directly, so the provider-derived
-    # model string is meaningless for it - reporting it would label results
-    # with a model that never ran.
-    if args.agent == "claude-code-host":
-        llm_model = args.claude_host_model
+    # claude-code-host and opencode drive CLIs on the host directly (Claude
+    # subscription, kiconnect respectively), so the provider-derived model
+    # string is meaningless for them - reporting it would label results with
+    # a model that never ran.
+    if args.agent in ("claude-code-host", "opencode"):
+        llm_model = args.claude_host_model if args.agent == "claude-code-host" \
+            else f"kiconnect/{args.opencode_model}"
+    else:
+        _, llm_model = get_llm_env(
+            model_provider=args.model_provider,
+            litellm_model_id=args.litellm_model_id,
+            bedrock_model_id=args.bedrock_model_id,
+            anthropic_model_id=args.anthropic_model_id,
+            kiconnect_model_id=args.kiconnect_model_id,
+            aws_region=args.aws_region,
+            aws_profile=args.aws_profile,
+        )
 
     print(f"Task: {args.task_path}")
     print(f"Agent: {args.agent}")
