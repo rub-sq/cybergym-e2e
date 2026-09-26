@@ -428,6 +428,9 @@ def main():
                     help="output dir; only valid with a single --openhands-model")
     ap.add_argument("--proxy-url", default="http://host.docker.internal:8817/v1",
                     help="URL of kiconnect_proxy.py AS SEEN FROM INSIDE THE CONTAINER")
+    ap.add_argument("--opencode-proxy-url", default=None,
+                    help="proxy URL for the opencode lane (it runs on the HOST, where "
+                         "host.docker.internal does not resolve; default: http://127.0.0.1:<port of --proxy-url>/v1)")
 
     ap.add_argument("--claude", action="store_true", help="enable the Claude Code lane")
     ap.add_argument("--claude-model", default="sonnet")
@@ -501,6 +504,13 @@ def main():
         models = args.opencode_model or ["qwen-qwen3-8-27b"]
         if args.opencode_output and len(models) > 1:
             ap.error("--opencode-output cannot be used with several models")
+        # The opencode CLI runs on the host, not in a container: the container
+        # --proxy-url (host.docker.internal) is unreachable from there, so it
+        # gets its own URL (loopback by default, same port).
+        oc_proxy = args.opencode_proxy_url
+        if not oc_proxy:
+            m = re.search(r":(\d+)", args.proxy_url)
+            oc_proxy = f"http://127.0.0.1:{m.group(1) if m else 8817}/v1"
         for model in models:
             tag = re.sub(r"[^A-Za-z0-9]+", "_", model).strip("_")[:40]
             out = args.opencode_output or f"agent_output_opencode_{tag}"
@@ -510,7 +520,7 @@ def main():
                 name, tasks, out,
                 opencode_cmd_factory(model, out, args.max_attempts, args.timeout),
                 gate,
-                env={"KICONNECT_BASE_URL": args.proxy_url,
+                env={"KICONNECT_BASE_URL": oc_proxy,
                      "KICONNECT_API_KEY": os.getenv("KICONNECT_API_KEY", "proxy-managed")},
                 log_path=str(log_dir / f"{name.replace(':', '_')}.log"),
                 handles_claude_quota=True,

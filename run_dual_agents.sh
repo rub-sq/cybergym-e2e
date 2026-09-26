@@ -123,7 +123,10 @@ if [[ "$want_openhands" == "1" ]]; then
 fi
 [[ "$want_claude" == "1" ]] && ORCH_ARGS+=(--claude --claude-model "$CLAUDE_MODEL")
 if [[ "$want_opencode" == "1" ]]; then
-    ORCH_ARGS+=(--opencode --proxy-url "http://host.docker.internal:$PROXY_PORT/v1")
+    # The opencode CLI runs ON THE HOST, where host.docker.internal does not
+    # resolve (and its bun runtime cannot do outbound remote HTTPS at all);
+    # it must hit the proxy on the loopback interface.
+    ORCH_ARGS+=(--opencode --opencode-proxy-url "http://127.0.0.1:$PROXY_PORT/v1")
     IFS=',' read -ra _models <<< "$OPENCODE_MODELS"
     for _m in "${_models[@]}"; do
         ORCH_ARGS+=(--opencode-model "$(echo "$_m" | xargs)")
