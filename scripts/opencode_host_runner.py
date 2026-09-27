@@ -163,7 +163,11 @@ def run_opencode_on_host(container_id, repo_to_patch, prompt, work_dir, model,
                 "KICONNECT_API_KEY env var not set; required for direct kiconnect access "
                 "(or point KICONNECT_BASE_URL at the key-rotating proxy)"
             )
-        api_key = "proxy-managed"
+        # Proxied: the proxy rewrites Authorization, but the client must still
+        # present a key that LOOKS valid - some CLI versions validate the key
+        # format before sending, and a bare placeholder would be rejected or
+        # sent upstream verbatim. A real pooled key is safe either way.
+        api_key = os.getenv("KICONNECT_KEY1") or "proxy-managed"
 
     config_path = _write_config(work_dir, model, base_url)
     # opencode v2 dropped --dir (it runs in the process CWD, set via cwd=

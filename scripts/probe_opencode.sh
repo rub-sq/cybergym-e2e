@@ -61,9 +61,12 @@ cat > "$WORK/opencode.json" <<EOF
 }
 EOF
 
-# Exact env + command opencode_host_runner.build uses (cwd = the repo)
+# Exact env + command opencode_host_runner.build uses (cwd = the repo).
+# Mirrors the runner's fallback: with the proxy, KICONNECT_API_KEY is a real
+# pooled key (the client must present a key that LOOKS valid even though the
+# proxy rewrites Authorization).
 export OPENCODE_CONFIG="$WORK/opencode.json"
-export KICONNECT_API_KEY="${KICONNECT_API_KEY:-proxy-managed}"
+export KICONNECT_API_KEY="${KICONNECT_API_KEY:-${KICONNECT_KEY1:-proxy-managed}}"
 export OPENCODE_DISABLE_AUTOUPDATE=1
 export OPENCODE_DISABLE_LSP_DOWNLOAD=1
 export OPENCODE_DISABLE_MODELS_FETCH=1

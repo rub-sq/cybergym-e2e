@@ -424,12 +424,26 @@ class Handler(BaseHTTPRequestHandler):
         req.add_header("Authorization", f"Bearer {key}")
         if body:
             req.add_header("Content-Length", str(len(body)))
+        # One line per upstream call: the client's own Authorization header
+        # (truncated) alongside the pool key actually used. When a client
+        # version sends its key through instead of trusting the rewrite, this
+        # makes the mismatch immediately visible.
+        client_auth = (self.headers.get("Authorization") or "").replace("Bearer ", "")[:8]
+        pool_label = self.pool._label(key)
         try:
             with urllib.request.urlopen(req, timeout=900) as resp:
-                return resp.status, resp.read().decode("utf-8", "replace"), dict(resp.headers)
+                text = resp.read().decode("utf-8", "replace")
+                log(f"{self.command} {self.path} -> {resp.status} "
+                    f"(client key {client_auth}... -> pool key {pool_label}...)")
+                return resp.status, text, dict(resp.headers)
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read().decode("utf-8", "replace"), dict(exc.headers)
+            text = exc.read().decode("utf-8", "replace")
+            log(f"{self.command} {self.path} -> {exc.code} "
+                f"(client key {client_auth}... -> pool key {pool_label}...) "
+                f"{text[:120]!r}")
+            return exc.code, text, dict(exc.headers)
         except Exception as exc:
+            log(f"{self.command} {self.path} -> upstream error: {exc}")
             return 502, f"proxy upstream error: {exc}", {}
 
     def _respond(self, status, text, headers):

@@ -489,7 +489,7 @@ def main():
                 openhands_cmd_factory(model, out, args.max_attempts, args.timeout),
                 gate,
                 env={"KICONNECT_BASE_URL": args.proxy_url,
-                     "KICONNECT_API_KEY": os.getenv("KICONNECT_API_KEY", "proxy-managed")},
+                     "KICONNECT_API_KEY": os.getenv("KICONNECT_KEY1", "proxy-managed")},
                 log_path=str(log_dir / f"{name.replace(':', '_')}.log"),
             ))
     if args.claude:
@@ -523,7 +523,7 @@ def main():
                 opencode_cmd_factory(model, out, args.max_attempts, args.timeout),
                 gate,
                 env={"KICONNECT_BASE_URL": oc_proxy,
-                     "KICONNECT_API_KEY": os.getenv("KICONNECT_API_KEY", "proxy-managed")},
+                     "KICONNECT_API_KEY": os.getenv("KICONNECT_KEY1", "proxy-managed")},
                 log_path=str(log_dir / f"{name.replace(':', '_')}.log"),
                 handles_claude_quota=True,
             ))
