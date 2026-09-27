@@ -41,9 +41,20 @@ CONCURRENCY_PATTERNS = (
     r"too many concurrent",
     r"concurrent request",
 )
+# A key the provider rejects outright (401 / "invalid_api_key" /
+# "incorrect api key"). Waiting or retrying the same key never helps;
+# rotate to the next one. A bad key must not burn the whole pool budget.
+AUTH_PATTERNS = (
+    r"invalid_api_key",
+    r"invalid api key",
+    r"incorrect api key",
+    r"api key (?:is )?(?:invalid|missing|required)",
+    r"no api key",
+)
 
 QUOTA_RE = re.compile("|".join(QUOTA_PATTERNS), re.IGNORECASE)
 CONCURRENCY_RE = re.compile("|".join(CONCURRENCY_PATTERNS), re.IGNORECASE)
+AUTH_RE = re.compile("|".join(AUTH_PATTERNS), re.IGNORECASE)
 
 
 # Newer GPT-5.x models reject the legacy parameter name outright, and litellm
@@ -177,11 +188,13 @@ def responses_to_chat(data, requested_model):
 
 
 def classify(status, body_text):
-    """Return 'quota', 'concurrency', 'ok' or 'error' for an upstream response."""
+    """Return 'quota', 'concurrency', 'auth', 'ok' or 'error' for upstream."""
     if 200 <= status < 300:
         return "ok"
     if CONCURRENCY_RE.search(body_text):
         return "concurrency"
+    if status == 401 or AUTH_RE.search(body_text):
+        return "auth"
     if status in (429, 402, 403) or QUOTA_RE.search(body_text):
         if QUOTA_RE.search(body_text) or status in (402, 403):
             return "quota"
@@ -280,12 +293,12 @@ class KeyPool:
             self._inflight[key] = max(0, self._inflight[key] - 1)
             self._lock.notify_all()
 
-    def lock_out(self, key, model=""):
+    def lock_out(self, key, model="", reason="quota exhausted"):
         with self._lock:
             self._locked_until[(key, model)] = time.time() + self._lock_seconds
             self._save()
             log(f"LOCKED {self._label(key)} for model {model or '*'} "
-                f"({self._lock_seconds}s, quota exhausted)")
+                f"({self._lock_seconds}s, {reason})")
             self._lock.notify_all()
 
     def status(self):
@@ -359,6 +372,11 @@ class Handler(BaseHTTPRequestHandler):
             if verdict == "quota":
                 self.pool.lock_out(key, requested_model or "")
                 continue                       # straight to another key
+            if verdict == "auth":
+                # Upstream rejects this key (401 / invalid_api_key). A retry
+                # of the same key can never succeed; lock it out and rotate.
+                self.pool.lock_out(key, requested_model or "", "key rejected upstream")
+                continue
             if verdict == "concurrency":
                 wait = min(30, 2 ** min(attempt, 4))
                 log(f"concurrency cap on {key.split(':')[0][:8]}; retry in {wait}s")
