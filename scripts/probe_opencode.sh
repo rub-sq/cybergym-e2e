@@ -14,8 +14,17 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 MODEL="${OPENCODE_MODEL:-qwen-qwen3-8-27b}"
 PORT="${PROXY_PORT:-8817}"
 WORK=$(mktemp -d /tmp/opencode_probe.XXXXXX)
+ORIG_PWD=$PWD
 PROXY_PID=""
-cleanup() { [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true; }
+cleanup() {
+    [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true
+    # An older probe bug ran opencode in the caller's cwd and made it
+    # 'create' hello.py there. Sweep that garbage if it appeared.
+    if [[ -n "${REPO:-}" && "$ORIG_PWD" != "$REPO" && -f "$ORIG_PWD/hello.py" ]]; then
+        rm -f "$ORIG_PWD/hello.py"
+        echo "removed stray $ORIG_PWD/hello.py left by a broken probe run"
+    fi
+}
 trap cleanup EXIT
 
 # A proxy left behind by a killed bench or earlier probe would silently
@@ -84,9 +93,12 @@ export OPENCODE_DISABLE_MODELS_FETCH=1
 export OPENCODE_DISABLE_CLAUDE_CODE=1
 echo "opencode $(opencode --version 2>&1 | head -1) | kiconnect/$MODEL via 127.0.0.1:$PORT"
 echo "workdir: $WORK"
-timeout 600 opencode run --standalone --model "kiconnect/$MODEL" --auto --format default \
+# v2 has no --dir: the process CWD is the project. The runner uses
+# Popen(cwd=repo_dir); this probe must do the same or the agent works in
+# the wrong tree (observed: it 'created' hello.py in the caller's cwd).
+( cd "$REPO" && timeout 600 opencode run --standalone --model "kiconnect/$MODEL" --auto --format default \
     "Edit hello.py so that the variable x equals 42. Do not create any other files." \
-    > "$WORK/oc.log" 2>&1
+    > "$WORK/oc.log" 2>&1 )
 RC=$?
 
 echo "--- opencode exit: $RC"
