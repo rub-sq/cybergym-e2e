@@ -166,9 +166,13 @@ def run_opencode_on_host(container_id, repo_to_patch, prompt, work_dir, model,
         api_key = "proxy-managed"
 
     config_path = _write_config(work_dir, model, base_url)
+    # opencode v2 dropped --dir (it runs in the process CWD, set via cwd=
+    # below) and gained --standalone, which keeps each run on its own
+    # private server instead of a shared background daemon - sequential
+    # benchmark tasks must not leak state across each other.
     command = [
         "opencode", "run",
-        "--dir", str(repo_dir),
+        "--standalone",
         "--model", f"kiconnect/{model}",
         "--auto",
         "--format", "default",

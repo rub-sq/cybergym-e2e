@@ -921,28 +921,65 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
     validation_containers = []
     agent_container_id = None
 
+    # --timeout is the TOTAL agent budget per task, shared across all
+    # attempts (paper protocol: 90 minutes + at most 2 attempts). Each
+    # attempt gets what is left, minus a margin for container setup so the
+    # total wall time stays near the budget; an attempt only runs if it can
+    # get a meaningful slice of the remainder.
+    SETUP_MARGIN = 900
+    MIN_ATTEMPT = 600
+    # Agent-phase budget only: container setup + agent execution. The
+    # harness's own validation builds are infrastructure time, not agent time.
+    budget_start = time.time()
+
     try:
         for attempt in range(1, args.max_attempts + 1):
+            # A previous attempt's container survives when its output was
+            # missing and the loop continued early (or the run hit a quota
+            # error) - remove it so failed tasks do not leak containers.
+            if agent_container_id:
+                cleanup_container(agent_container_id)
+                agent_container_id = None
+
+            per_attempt = max(0, int(args.timeout - (time.time() - budget_start) - SETUP_MARGIN))
+            if per_attempt < MIN_ATTEMPT:
+                used = time.time() - budget_start
+                print(f"  Budget exhausted ({used:.0f}s of {args.timeout}s used); "
+                      f"skipping attempt {attempt}")
+                all_attempts.append({
+                    "attempt": attempt,
+                    "agent_exec_seconds": 0,
+                    "stage1": "budget_exhausted",
+                    "stage2": "skipped",
+                    "stage3": "skipped",
+                    "stage4": "skipped",
+                    "success": False,
+                })
+                break
+
             print(f"\n{'='*60}")
-            print(f"ATTEMPT {attempt}/{args.max_attempts}")
+            print(f"ATTEMPT {attempt}/{args.max_attempts} "
+                  f"(budget left {per_attempt + SETUP_MARGIN:.0f}s)")
             print(f"{'='*60}\n")
 
+            attempt_args = argparse.Namespace(**vars(args))
+            attempt_args.timeout = per_attempt
             agent_start = time.time()
 
             # Generate prompt and run agent
             prompt = get_prompt(args, repo_dir, config.get("repo_to_patch"), feedback)
             work_dir = run_dir / f"workspace_attempt_{attempt}"
             work_dir.mkdir(parents=True, exist_ok=True)
-            
+
             exit_code, poc_file, patch_file, log_file, agent_container_id, agent_exec_time = run_agent(
-                args, config, script_path, data_path, prompt, attempt, work_dir, trajectory_dir
+                attempt_args, config, script_path, data_path, prompt, attempt, work_dir, trajectory_dir
             )
 
             agent_time = time.time() - agent_start
             print(f"  Agent: {agent_time:.1f}s ({agent_time/60:.1f}m), exec: {agent_exec_time:.1f}s ({agent_exec_time/60:.1f}m), exit={exit_code}")
 
-            # Check for generated files
-            if args.mode == "e2e" and not poc_file.exists():
+            # Check for generated files (poc/patch are None on early quota exits)
+            if args.mode == "e2e" and not (poc_file and poc_file.exists()):
                 print("  No PoC generated!")
                 all_attempts.append({
                     "attempt": attempt,

@@ -415,7 +415,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tasks", default="tasks_920.txt")
     ap.add_argument("--min-free-gb", type=float, default=50.0)
-    ap.add_argument("--timeout", type=int, default=3600)
+    ap.add_argument("--timeout", type=int, default=5400,
+                    help="TOTAL agent budget per task in seconds, shared across "
+                         "attempts (paper protocol: 90 minutes + at most 2 attempts)")
     ap.add_argument("--max-attempts", type=int, default=2)
     ap.add_argument("--log-dir", default="parallel_logs_dual")
 
