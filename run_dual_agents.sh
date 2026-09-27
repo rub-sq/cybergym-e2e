@@ -36,6 +36,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 [[ -f .env ]] && { set -a; source .env; set +a; }
 [[ -f .venv_runner/bin/activate ]] && source .venv_runner/bin/activate
 
+# A system-wide http_proxy must never intercept the loopback proxy hop;
+# export it for the orchestrator and every agent it spawns.
+export no_proxy="${no_proxy:+$no_proxy,}127.0.0.1,localhost"
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost"
+
 KICONNECT_KEY1="${1:-${KICONNECT_KEY1:-}}"
 KICONNECT_KEY2="${2:-${KICONNECT_KEY2:-}}"
 # Comma-separated: one lane per model. KIConnect meters limits per model,
@@ -93,10 +98,17 @@ if [[ "$want_proxy" == "1" ]]; then
     if ! kill -0 "$PROXY_PID" 2>/dev/null; then
         echo "ERROR: proxy failed to start - see $LOG_DIR/proxy.log"; tail -20 "$LOG_DIR/proxy.log"; exit 1
     fi
-    if ! curl -sf "http://127.0.0.1:$PROXY_PORT/_pool" > /dev/null; then
+    # curl may be absent on minimal servers, and a system http_proxy env var
+    # would reroute even loopback requests; python3 + no_proxy covers both.
+    POOL_GET="import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:$PROXY_PORT/_pool', timeout=5).read().decode(), end='')"
+    if ! env no_proxy="127.0.0.1,localhost" NO_PROXY="127.0.0.1,localhost" \
+        http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= \
+        python3 -c "$POOL_GET" > /dev/null 2>&1; then
         echo "ERROR: proxy is not answering on port $PROXY_PORT"; exit 1
     fi
-    echo "proxy up (pid $PROXY_PID); pool: $(curl -s http://127.0.0.1:$PROXY_PORT/_pool | tr -d '\n ')"
+    POOL_STATUS=$(env no_proxy="127.0.0.1,localhost" NO_PROXY="127.0.0.1,localhost" \
+        http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= python3 -c "$POOL_GET" 2>/dev/null || true)
+    echo "proxy up (pid $PROXY_PID); pool: $(echo "$POOL_STATUS" | tr -d '\n ')"
 fi
 
 if [[ "$want_claude" == "1" ]]; then
