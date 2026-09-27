@@ -127,7 +127,10 @@ fi
 
 ORCH_ARGS=(--tasks "$TASKS" --min-free-gb "$MIN_FREE_GB" --log-dir "$LOG_DIR")
 if [[ "$want_openhands" == "1" ]]; then
-    ORCH_ARGS+=(--openhands --proxy-url "http://host.docker.internal:$PROXY_PORT/v1")
+    # Container-side view of the proxy. On Linux, host.docker.internal maps to
+    # host-gateway, which may not be the interface the proxy is reachable on;
+    # OPENHANDS_PROXY_URL overrides it (e.g. http://172.17.0.1:8817/v1).
+    ORCH_ARGS+=(--openhands --proxy-url "${OPENHANDS_PROXY_URL:-http://host.docker.internal:$PROXY_PORT/v1}")
     IFS=',' read -ra _models <<< "$OPENHANDS_MODELS"
     for _m in "${_models[@]}"; do
         ORCH_ARGS+=(--openhands-model "$(echo "$_m" | xargs)")
