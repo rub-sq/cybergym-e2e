@@ -18,12 +18,23 @@ PROXY_PID=""
 cleanup() { [[ -n "$PROXY_PID" ]] && kill "$PROXY_PID" 2>/dev/null || true; }
 trap cleanup EXIT
 
+# A proxy left behind by a killed bench or earlier probe would silently
+# serve this test with STALE code - kill our own leftovers first (never
+# while a live orchestrator is running: that proxy belongs to the bench).
+if pgrep -f dual_agent_orchestrator > /dev/null; then
+    echo "WARNING: a bench orchestrator is running - its proxy on $PORT is in use; the test talks to THAT code, not the checked-out one."
+else
+    pkill -f "kiconnect_proxy.py --port $PORT" 2>/dev/null && sleep 1 || true
+fi
+
 if ! python3 -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:$PORT/_pool',timeout=3)" 2>/dev/null; then
     echo "starting proxy on $PORT ..."
     python3 scripts/kiconnect_proxy.py --port "$PORT" --state-file "$WORK/pool.json" \
         --key "$KICONNECT_KEY1" ${KICONNECT_KEY2:+--key "$KICONNECT_KEY2"} > "$WORK/proxy.log" 2>&1 &
     PROXY_PID=$!
     sleep 2
+else
+    echo "WARNING: something else is already serving on $PORT - a manual proxy is fine, but the test below talks to THAT code, not the checked-out one."
 fi
 
 REPO="$WORK/repo"
