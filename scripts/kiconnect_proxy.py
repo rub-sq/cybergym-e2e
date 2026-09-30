@@ -430,17 +430,38 @@ class Handler(BaseHTTPRequestHandler):
         # makes the mismatch immediately visible.
         client_auth = (self.headers.get("Authorization") or "").replace("Bearer ", "")[:8]
         pool_label = self.pool._label(key)
+        # KICONNECT_PROXY_DEBUG=1: capture the full request/response exchange
+        # for offline diagnosis (bodies can be hundreds of KB).
+        dbg = None
+        if os.getenv("KICONNECT_PROXY_DEBUG"):
+            try:
+                import datetime
+                stamp = datetime.datetime.now().strftime("%H%M%S%f")
+                dbg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "proxy_debug")
+                os.makedirs(dbg_dir, exist_ok=True)
+                with open(os.path.join(dbg_dir, f"{stamp}.req.json"), "wb") as fh:
+                    fh.write(body or b"")
+                dbg = (f"{stamp}.resp.txt", dbg_dir)
+            except Exception as exc:
+                log(f"debug capture failed: {exc}")
         try:
             with urllib.request.urlopen(req, timeout=900) as resp:
                 text = resp.read().decode("utf-8", "replace")
                 log(f"{self.command} {self.path} -> {resp.status} "
                     f"(client key {client_auth}... -> pool key {pool_label}...)")
+                if dbg:
+                    with open(os.path.join(dbg[1], dbg[0]), "w") as fh:
+                        fh.write(text)
                 return resp.status, text, dict(resp.headers)
         except urllib.error.HTTPError as exc:
             text = exc.read().decode("utf-8", "replace")
             log(f"{self.command} {self.path} -> {exc.code} "
                 f"(client key {client_auth}... -> pool key {pool_label}...) "
                 f"{text[:120]!r}")
+            if dbg:
+                with open(os.path.join(dbg[1], dbg[0]), "w") as fh:
+                    fh.write(f"HTTP {exc.code}\n{text}")
             return exc.code, text, dict(exc.headers)
         except Exception as exc:
             log(f"{self.command} {self.path} -> upstream error: {exc}")
