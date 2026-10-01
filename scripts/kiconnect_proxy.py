@@ -403,13 +403,29 @@ class Handler(BaseHTTPRequestHandler):
         model = payload.get("model", "")
         is_chat = "chat/completions" in self.path
 
-        # Some OpenAI-compatible gateways (vllm fronted by a strict API
-        # gateway) reject tool-call history where the assistant message's
-        # content is null ("$.messages[N].content: Invalid format for input").
-        # Normalise null -> "" before forwarding.
+        # Some OpenAI-compatible gateways (vllm behind a strict OpenAI-style
+        # validator) reject non-string message content ("$.messages[N].content:
+        # Invalid format for input"): tool-call history arrives with content
+        # null or as a multimodal array, even empty ("[]"). Normalise to plain
+        # strings before forwarding; array content that actually carries image
+        # parts is left untouched so vision models keep working.
         for message in payload.get("messages") or []:
-            if isinstance(message, dict) and message.get("content") is None:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if content is None:
                 message["content"] = ""
+            elif isinstance(content, list):
+                has_image = any(
+                    isinstance(part, dict)
+                    and part.get("type") not in ("text", None)
+                    for part in content
+                )
+                if not has_image:
+                    message["content"] = "".join(
+                        part.get("text", "") for part in content
+                        if isinstance(part, dict)
+                    )
 
         if is_chat and needs_responses_api(model):
             payload.pop("stream", None)   # SSE is not emulated; force one-shot
