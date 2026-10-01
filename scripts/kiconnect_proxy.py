@@ -403,6 +403,14 @@ class Handler(BaseHTTPRequestHandler):
         model = payload.get("model", "")
         is_chat = "chat/completions" in self.path
 
+        # Some OpenAI-compatible gateways (vllm fronted by a strict API
+        # gateway) reject tool-call history where the assistant message's
+        # content is null ("$.messages[N].content: Invalid format for input").
+        # Normalise null -> "" before forwarding.
+        for message in payload.get("messages") or []:
+            if isinstance(message, dict) and message.get("content") is None:
+                message["content"] = ""
+
         if is_chat and needs_responses_api(model):
             payload.pop("stream", None)   # SSE is not emulated; force one-shot
             converted = chat_to_responses(payload)
