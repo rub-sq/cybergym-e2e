@@ -475,6 +475,13 @@ def get_llm_env(
             "OPENAI_BASE_URL": kiconnect_base_url,
             "LLM_DROP_PARAMS": "false",
         }
+        # openhands only auto-enables native tool calling for models on its
+        # hardcoded allow-list (qwen3-coder*, gpt-*, claude-*); other qwen
+        # builds fall back to "mock" tool calling (prompt-based, no tools sent)
+        # and just emit chat prose -> empty actions -> stuck-in-loop. qwen3.8
+        # does real tool calling, so force the native path for it only.
+        if "qwen" in kiconnect_model_id.lower():
+            env["LLM_NATIVE_TOOL_CALLING"] = "true"
         return env, llm_model
     else:
         llm_model = litellm_model_id
