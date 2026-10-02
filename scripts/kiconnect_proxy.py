@@ -409,12 +409,14 @@ class Handler(BaseHTTPRequestHandler):
         # null or as a multimodal array, even empty ("[]"). Normalise to plain
         # strings before forwarding; array content that actually carries image
         # parts is left untouched so vision models keep working.
+        mutated = False
         for message in payload.get("messages") or []:
             if not isinstance(message, dict):
                 continue
             content = message.get("content")
             if content is None:
                 message["content"] = ""
+                mutated = True
             elif isinstance(content, list):
                 has_image = any(
                     isinstance(part, dict)
@@ -426,6 +428,7 @@ class Handler(BaseHTTPRequestHandler):
                         part.get("text", "") for part in content
                         if isinstance(part, dict)
                     )
+                    mutated = True
 
         if is_chat and needs_responses_api(model):
             payload.pop("stream", None)   # SSE is not emulated; force one-shot
@@ -434,8 +437,9 @@ class Handler(BaseHTTPRequestHandler):
             return json.dumps(converted).encode("utf-8"), True, model
 
         payload, changed = adapt_chat_request(payload, model)
-        if changed:
-            log(f"rewrote max_tokens -> max_completion_tokens for {model}")
+        if changed or mutated:
+            if changed:
+                log(f"rewrote max_tokens -> max_completion_tokens for {model}")
             return json.dumps(payload).encode("utf-8"), False, model
         return body, False, model
 
