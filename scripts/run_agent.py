@@ -816,12 +816,22 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
         log_file = trajectory_dir / f"attempt_{attempt}.log"
 
         agent_exec_start = time.time()
+        # Host-side agents run ON THE HOST, so their workspace must live OUTSIDE
+        # the benchmark repo: projects/<task>/patch.diff (ground-truth patch)
+        # and data/ sit next to it, and a host agent can simply walk up the
+        # tree. Observed in practice: opencode/qwen cd'ed to the repo root and
+        # read the GT patch + test scripts (mongoose/arvo_51757, 2026-10).
+        isolated_host_work = None
+        if args.agent in ("claude-code-host", "opencode"):
+            isolated_host_work = Path(os.getenv("HOST_AGENT_WORK_ROOT", "/tmp")) / \
+                f"cybergym_{args.agent}_{os.getpid()}"
+            isolated_host_work.mkdir(parents=True, exist_ok=True)
         if args.agent == "claude-code-host":
             exit_code, host_patch, _out, _el = claude_host_runner.run_claude_on_host(
                 container_id=container_id,
                 repo_to_patch=config.get("repo_to_patch"),
                 prompt=prompt,
-                work_dir=work_dir / "host_workspace",
+                work_dir=(isolated_host_work if isolated_host_work else work_dir) / "host_workspace",
                 model=args.claude_host_model,
                 timeout=args.timeout,
                 wait_cycle=attempt,
@@ -832,7 +842,7 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
                 container_id=container_id,
                 repo_to_patch=config.get("repo_to_patch"),
                 prompt=prompt,
-                work_dir=work_dir / "host_workspace",
+                work_dir=(isolated_host_work if isolated_host_work else work_dir) / "host_workspace",
                 model=args.opencode_model,
                 timeout=args.timeout,
                 wait_cycle=attempt,
@@ -974,6 +984,14 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
             exit_code, poc_file, patch_file, log_file, agent_container_id, agent_exec_time = run_agent(
                 attempt_args, config, script_path, data_path, prompt, attempt, work_dir, trajectory_dir
             )
+
+            # Host-side workspaces live outside the repo (anti-cheat); drop the
+            # outer dir once the attempt is over (source tree is already gone
+            # from the runner's cleanup).
+            if args.agent in ("claude-code-host", "opencode"):
+                host_root = Path(os.getenv("HOST_AGENT_WORK_ROOT", "/tmp")) / \
+                    f"cybergym_{args.agent}_{os.getpid()}"
+                shutil.rmtree(host_root, ignore_errors=True)
 
             agent_time = time.time() - agent_start
             print(f"  Agent: {agent_time:.1f}s ({agent_time/60:.1f}m), exec: {agent_exec_time:.1f}s ({agent_exec_time/60:.1f}m), exit={exit_code}")
