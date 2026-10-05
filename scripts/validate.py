@@ -88,10 +88,19 @@ def restore_src(src_dir, verbose=True):
         if verbose:
             print("  restore_src: changed cwd to / before restore")
 
-    result = subprocess.run(
-        f"sudo rm -rf {src_dir} && sudo cp -a {backup_path} {src_dir}",
-        shell=True, capture_output=True, encoding='utf-8', errors='replace'
-    )
+    # rm -rf can race with files being recreated (notably inside .git of a
+    # large repo) and fail with "Directory not empty"; retry before sinking
+    # the whole validation.
+    result = None
+    for attempt in range(3):
+        result = subprocess.run(
+            f"sudo rm -rf {src_dir} && sudo cp -a {backup_path} {src_dir}",
+            shell=True, capture_output=True, encoding='utf-8', errors='replace'
+        )
+        if result.returncode == 0:
+            break
+        import time
+        time.sleep(2)
     if result.returncode != 0:
         raise Exception(f"Failed to restore source: {result.stderr[-500:]}")
 
