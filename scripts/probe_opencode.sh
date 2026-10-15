@@ -106,6 +106,9 @@ if [[ "$IN_CONTAINER" == "1" ]]; then
     CID=$(docker run -d --rm --add-host=host.docker.internal:host-gateway \
         "$IMAGE" sleep infinity)
     trap 'kill "$PROXY_PID" 2>/dev/null || true; docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+    # The scratch image has no /src (task images do); docker cp will not
+    # create a missing parent directory.
+    docker exec "$CID" mkdir -p /src
     docker cp "$REPO" "$CID:/src/repo"
     docker cp scripts/install_opencode_in_container.sh "$CID:/install_agent.sh"
     docker exec "$CID" bash -eux /install_agent.sh > "$WORK/install.log" 2>&1 \
