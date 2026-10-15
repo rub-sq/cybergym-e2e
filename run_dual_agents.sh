@@ -47,6 +47,13 @@ export NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost"
 
 KICONNECT_KEY1="${1:-${KICONNECT_KEY1:-}}"
 KICONNECT_KEY2="${2:-${KICONNECT_KEY2:-}}"
+# The proxy rotates across every pooled key, but a model id is only valid on
+# the account it belongs to (mistral's ki.inferenz.nrw-... id lives on KEY2;
+# run_920_tasks.sh ran its Mistral batch on KEY2 alone). KICONNECT_KEY2_ONLY=1
+# pools KEY2 only, otherwise requests landing on KEY1 get "model does not exist".
+if [[ "${KICONNECT_KEY2_ONLY:-0}" == "1" ]]; then
+    KICONNECT_KEY1="$KICONNECT_KEY2"; KICONNECT_KEY2=""
+fi
 # Comma-separated: one lane per model. KIConnect meters limits per model,
 # so e.g. a slow codex lane and a fast nano lane do not block each other.
 OPENHANDS_MODELS="${OPENHANDS_MODELS:-${OPENHANDS_MODEL:-openai-gpt-oss-120b}}"

@@ -20,6 +20,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 IN_CONTAINER=0
 [[ "${1:-}" == "--in-container" ]] && IN_CONTAINER=1
 
+# KICONNECT_KEY2_ONLY=1: pool KEY2 alone (see run_dual_agents.sh) - model ids
+# are per account, so e.g. mistral's ki.inferenz.nrw-... id only exists on KEY2.
+if [[ "${KICONNECT_KEY2_ONLY:-0}" == "1" ]]; then
+    KICONNECT_KEY1="$KICONNECT_KEY2"; KICONNECT_KEY2=""
+fi
+
 MODEL="${OPENCODE_MODEL:-qwen-qwen3-8-27b}"
 PORT="${PROXY_PORT:-8817}"
 WORK=$(mktemp -d /tmp/opencode_probe.XXXXXX)
