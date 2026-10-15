@@ -137,7 +137,7 @@ EOF
     docker cp "$WORK/agent.env" "$CID:/work/agent.env"
     docker exec "$CID" chown agent:agent /work/agent.env /work/opencode.json /work/.prompt.txt
 
-    RUN_CMD="cd /src/repo && opencode run --standalone --model kiconnect/$MODEL --auto --format default \"\$(cat /work/.prompt.txt)\""
+    RUN_CMD="cd /src/repo && opencode run --model kiconnect/$MODEL --auto --format default \"\$(cat /work/.prompt.txt)\""
     timeout 900 docker exec "$CID" bash -c "su agent -c '. /work/agent.env && $RUN_CMD'" \
         > "$WORK/oc.log" 2>&1
     RC=$?

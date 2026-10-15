@@ -337,9 +337,11 @@ def run_opencode_in_container(container_id, repo_to_patch, prompt, model,
         "OPENCODE_DISABLE_CLAUDE_CODE": "1",
     }
     _write_env_file(container_id, env)
+    # No --standalone: the 1.x CLI the installer fetches rejects it (prints
+    # usage, exit 1). Without --attach, `opencode run` starts its own server,
+    # and every task has a fresh container, so no state is shared anyway.
     run_cmd = (
         f"cd {shlex.quote(repo_dir)} && opencode run "
-        "--standalone "
         f"--model {shlex.quote('kiconnect/' + model)} "
         "--auto --format default "
         f"\"$(cat {shlex.quote(WORKDIR + '/.prompt.txt')})\""
