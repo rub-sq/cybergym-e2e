@@ -147,7 +147,9 @@ EOF
     timeout 900 docker exec "$CID" bash -c "su agent -c '. /work/agent.env && $RUN_CMD'" \
         > "$WORK/oc.log" 2>&1
     RC=$?
-    DIFF=$(docker exec "$CID" bash -c "cd /src/repo && git -c user.email=cybergym@localhost -c user.name=cybergym diff" 2>/dev/null)
+    # Same invocation as container_agent_runner._extract_patch: root running git
+    # in an agent-owned tree needs safe.directory. stderr is kept visible here.
+    DIFF=$(docker exec "$CID" bash -c "cd /src/repo && git -c safe.directory='*' -c user.email=cybergym@localhost -c user.name=cybergym diff" 2>&1)
 
     echo "--- opencode (in-container) exit: $RC"
     tail -8 "$WORK/oc.log"

@@ -116,9 +116,13 @@ def _extract_patch(container_id, repo_dir):
     # (temp + move so a partial write never leaves a half-empty file). No
     # round-trip through the host: patches can be large and the container
     # already owns the only copy of the source tree.
+    # exec_run is root, but the tree is chowned to the agent user; without
+    # safe.directory git refuses ("dubious ownership"), the redirected stderr
+    # hides it and every run would look like no_patch.
     exec_run(
         container_id,
-        f"cd {repo_dir_q} && git -c user.email=cybergym@localhost "
+        f"cd {repo_dir_q} && git -c safe.directory='*' "
+        f"-c user.email=cybergym@localhost "
         f"-c user.name=cybergym diff > /output/.fix.patch.tmp 2>/dev/null; "
         f"if [ -s /output/.fix.patch.tmp ]; then "
         f"mv /output/.fix.patch.tmp /output/fix.patch; "
