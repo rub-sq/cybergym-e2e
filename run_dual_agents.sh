@@ -2,8 +2,13 @@
 # Launch the long-running multi-agent benchmark.
 #
 #   lanes   OpenHands   -> KIConnect, through a key-rotating proxy
-#           Claude Code -> the host's logged-in CLI (subscription auth)
-#           opencode    -> the host's opencode CLI, also through the proxy
+#           Claude Code -> Claude Code CLI (subscription auth)
+#           opencode    -> opencode CLI, also through the proxy
+#
+# Every agent CLI runs INSIDE its task container (anti-cheat: the agent can
+# never see the benchmark repo on the host). The only host-side state is the
+# KIConnect proxy and, for claude, the ~/.claude subscription login that gets
+# streamed into each container (or ANTHROPIC_API_KEY in the environment).
 #
 # Every lane runs one task at a time and blocks independently: OpenHands or
 # opencode waiting on KIConnect quota does not stall Claude, and Claude
@@ -21,8 +26,7 @@
 #   OPENHANDS_MODEL                   KIConnect model id (see below)
 #   CLAUDE_MODEL                      default: sonnet
 #   OPENCODE_MODELS                   comma-separated kiconnect model ids for
-#                                     opencode lanes (default: qwen-qwen3-8-27b);
-#                                     requires the `opencode` CLI on PATH
+#                                     opencode lanes (default: qwen-qwen3-8-27b)
 #   MIN_FREE_GB                       default: 50
 #   TASKS                             default: tasks_920.txt
 #
@@ -75,7 +79,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# The KIConnect proxy serves both the OpenHands and the opencode lanes.
+# The KIConnect proxy serves the OpenHands and opencode lanes.
 want_proxy=0
 [[ "$want_openhands" == "1" ]] && want_proxy=1
 [[ "$want_opencode" == "1" ]] && want_proxy=1
@@ -111,37 +115,26 @@ if [[ "$want_proxy" == "1" ]]; then
     echo "proxy up (pid $PROXY_PID); pool: $(echo "$POOL_STATUS" | tr -d '\n ')"
 fi
 
-if [[ "$want_claude" == "1" ]]; then
-    if ! command -v claude > /dev/null; then
-        echo "ERROR: claude CLI not found on PATH"; exit 1
-    fi
-    echo "claude CLI: $(claude --version 2>&1 | head -1)"
-fi
-
-if [[ "$want_opencode" == "1" ]]; then
-    if ! command -v opencode > /dev/null; then
-        echo "ERROR: opencode CLI not found on PATH (install: curl -fsSL https://opencode.ai/install | bash)"; exit 1
-    fi
-    echo "opencode CLI: $(opencode --version 2>&1 | head -1)"
-fi
-
 ORCH_ARGS=(--tasks "$TASKS" --min-free-gb "$MIN_FREE_GB" --log-dir "$LOG_DIR")
 if [[ "$want_openhands" == "1" ]]; then
     # Container-side view of the proxy. On Linux, host.docker.internal maps to
     # host-gateway, which may not be the interface the proxy is reachable on;
-    # OPENHANDS_PROXY_URL overrides it (e.g. http://172.17.0.1:8817/v1).
+    # OPENHANDS_PROXY_URL overrides it (e.g. http://10.150.0.212:8817/v1 on
+    # the tower, where host-gateway traffic is refused).
     ORCH_ARGS+=(--openhands --proxy-url "${OPENHANDS_PROXY_URL:-http://host.docker.internal:$PROXY_PORT/v1}")
     IFS=',' read -ra _models <<< "$OPENHANDS_MODELS"
     for _m in "${_models[@]}"; do
         ORCH_ARGS+=(--openhands-model "$(echo "$_m" | xargs)")
     done
 fi
+# claude and opencode run INSIDE their task containers:
+#  - claude needs the host's ~/.claude subscription login (streamed into the
+#    container per run) or ANTHROPIC_API_KEY in the environment.
+#  - opencode reaches the proxy through the same container-side URL as
+#    openhands (the --proxy-url above).
 [[ "$want_claude" == "1" ]] && ORCH_ARGS+=(--claude --claude-model "$CLAUDE_MODEL")
 if [[ "$want_opencode" == "1" ]]; then
-    # The opencode CLI runs ON THE HOST, where host.docker.internal does not
-    # resolve (and its bun runtime cannot do outbound remote HTTPS at all);
-    # it must hit the proxy on the loopback interface.
-    ORCH_ARGS+=(--opencode --opencode-proxy-url "http://127.0.0.1:$PROXY_PORT/v1")
+    ORCH_ARGS+=(--opencode)
     IFS=',' read -ra _models <<< "$OPENCODE_MODELS"
     for _m in "${_models[@]}"; do
         ORCH_ARGS+=(--opencode-model "$(echo "$_m" | xargs)")

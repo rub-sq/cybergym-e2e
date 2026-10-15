@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Run two agent lanes concurrently for weeks, each blocking independently.
 
-Lanes:
+Lanes (every agent CLI runs INSIDE its task container - see
+container_agent_runner.py; nothing runs on the host anymore):
   openhands  - KIConnect models, reached through scripts/kiconnect_proxy.py so
                several keys can be pooled and rotated on quota.
-  claude     - the host's logged-in Claude Code CLI (subscription auth).
+  claude     - Claude Code CLI (subscription auth; the host's ~/.claude login
+               is streamed into the container per run, or ANTHROPIC_API_KEY).
+  opencode   - opencode CLI, also through the proxy (same container-side
+               URL as openhands).
 
 The lanes are deliberately decoupled. When OpenHands has burned every KIConnect
 key it waits on the proxy; that must not stall Claude. When Claude hits its
@@ -372,6 +376,8 @@ def openhands_cmd_factory(model_id, output_dir, attempts, timeout):
 
 
 def claude_cmd_factory(model, output_dir, attempts, timeout):
+    """Claude Code running INSIDE the task container (subscription auth from
+    the host's ~/.claude, streamed in per run by container_agent_runner)."""
     def build(task):
         return [
             sys.executable, str(SCRIPTS_DIR / "run_agent.py"), task,
@@ -387,7 +393,8 @@ def claude_cmd_factory(model, output_dir, attempts, timeout):
 
 
 def opencode_cmd_factory(model, output_dir, attempts, timeout):
-    """One lane per kiconnect model id, driven through the host's opencode CLI.
+    """One lane per kiconnect model id, opencode running INSIDE the task
+    container and reaching the proxy through the container-side URL.
 
     The lanes share KIConnect's pooled keys via the proxy, so they block on
     quota together - one lane per model keeps the per-model meters separate.
@@ -429,23 +436,27 @@ def main():
     ap.add_argument("--openhands-output", default=None,
                     help="output dir; only valid with a single --openhands-model")
     ap.add_argument("--proxy-url", default="http://host.docker.internal:8817/v1",
-                    help="URL of kiconnect_proxy.py AS SEEN FROM INSIDE THE CONTAINER")
-    ap.add_argument("--opencode-proxy-url", default=None,
-                    help="proxy URL for the opencode lane (it runs on the HOST, where "
-                         "host.docker.internal does not resolve; default: http://127.0.0.1:<port of --proxy-url>/v1)")
+                    help="URL of kiconnect_proxy.py AS SEEN FROM INSIDE THE CONTAINER "
+                         "(used by every KIConnect lane: openhands and opencode both "
+                         "run inside their task container)")
 
-    ap.add_argument("--claude", action="store_true", help="enable the Claude Code lane")
+    ap.add_argument("--claude", action="store_true",
+                    help="enable the Claude Code lane (runs INSIDE the task "
+                         "container; needs a host ~/.claude login or ANTHROPIC_API_KEY)")
     ap.add_argument("--claude-model", default="sonnet")
+    # Kept at the historical name so existing result dirs keep being resumed.
     ap.add_argument("--claude-output", default="agent_output_claude_host")
 
-    ap.add_argument("--opencode", action="store_true", help="enable the opencode (kiconnect) lane(s)")
+    ap.add_argument("--opencode", action="store_true",
+                    help="enable the opencode (kiconnect) lane(s); runs INSIDE the "
+                         "task container, reaching the proxy via --proxy-url like openhands")
     ap.add_argument("--opencode-model", action="append", default=[],
                     help="kiconnect model id for opencode; repeat for one lane per model")
     ap.add_argument("--opencode-output", default=None,
                     help="output dir; only valid with a single --opencode-model")
     args = ap.parse_args()
 
-    if not args.openhands and not args.claude and not args.opencode:
+    if not (args.openhands or args.claude or args.opencode):
         ap.error("enable at least one lane: --openhands, --claude and/or --opencode")
 
     tasks = read_tasks(args.tasks)
@@ -506,13 +517,9 @@ def main():
         models = args.opencode_model or ["qwen-qwen3-8-27b"]
         if args.opencode_output and len(models) > 1:
             ap.error("--opencode-output cannot be used with several models")
-        # The opencode CLI runs on the host, not in a container: the container
-        # --proxy-url (host.docker.internal) is unreachable from there, so it
-        # gets its own URL (loopback by default, same port).
-        oc_proxy = args.opencode_proxy_url
-        if not oc_proxy:
-            m = re.search(r":(\d+)", args.proxy_url)
-            oc_proxy = f"http://127.0.0.1:{m.group(1) if m else 8817}/v1"
+        # opencode runs INSIDE the task container, so it reaches the proxy via
+        # the same container-side URL as openhands (--proxy-url / the
+        # OPENHANDS_PROXY_URL override on hosts where host-gateway is refused).
         for model in models:
             tag = re.sub(r"[^A-Za-z0-9]+", "_", model).strip("_")[:40]
             out = args.opencode_output or f"agent_output_opencode_{tag}"
@@ -522,7 +529,7 @@ def main():
                 name, tasks, out,
                 opencode_cmd_factory(model, out, args.max_attempts, args.timeout),
                 gate,
-                env={"KICONNECT_BASE_URL": oc_proxy,
+                env={"KICONNECT_BASE_URL": args.proxy_url,
                      "KICONNECT_API_KEY": os.getenv("KICONNECT_KEY1", "proxy-managed")},
                 log_path=str(log_dir / f"{name.replace(':', '_')}.log"),
                 handles_claude_quota=True,

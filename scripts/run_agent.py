@@ -513,6 +513,21 @@ chown -R agent:agent /src /output /out /work 2>/dev/null || true
         if code != 0:
             raise Exception(f"Failed to install Gemini CLI: {stderr[-500:]}")
 
+    elif agent_id in ("claude-code-host", "opencode"):
+        # These CLIs run inside THIS container via docker exec
+        # (container_agent_runner), so they must be installed here.
+        script_name = "install_claude_in_container.sh" if agent_id == "claude-code-host" \
+            else "install_opencode_in_container.sh"
+        if not scripts_dir:
+            raise ValueError("scripts_dir required for " + agent_id)
+        copy_to_container(container_id, scripts_dir / script_name, "/install_agent.sh")
+        code, _, stderr = exec_run(
+            container_id, "bash -eux /install_agent.sh",
+            f"Installing {agent_id}", timeout=1800
+        )
+        if code != 0:
+            raise Exception(f"Failed to install {agent_id}: {stderr[-500:]}")
+
     else:
         raise ValueError(f"Unknown agent: {agent_id}")
 
@@ -769,6 +784,7 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
     poc_file = None
     patch_file = None
 
+
     try:
         # Start container
         print("  Starting container...")
@@ -807,47 +823,43 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
         # Setup workspace (don't copy ground truth PoC - agent shouldn't see it)
         setup_workspace(container_id, data_path, script_path, args.mode, copy_gt_poc=False, scripts_dir=scripts_dir)
 
-        # Install agent. The *-host agents drive CLIs on the host machine, so
-        # nothing needs installing inside the container.
-        if args.agent not in ("claude-code-host", "opencode"):
-            install(container_id, args.agent, scripts_dir=scripts_dir)
+        # Install agent. claude-code-host and opencode run their CLI INSIDE
+        # this container (via docker exec, see container_agent_runner);
+        # every agent installs under its own id.
+        install(container_id, args.agent, scripts_dir=scripts_dir)
 
         # Execute agent
         log_file = trajectory_dir / f"attempt_{attempt}.log"
 
         agent_exec_start = time.time()
-        # Host-side agents run ON THE HOST, so their workspace must live OUTSIDE
-        # the benchmark repo: projects/<task>/patch.diff (ground-truth patch)
-        # and data/ sit next to it, and a host agent can simply walk up the
-        # tree. Observed in practice: opencode/qwen cd'ed to the repo root and
-        # read the GT patch + test scripts (mongoose/arvo_51757, 2026-10).
-        isolated_host_work = None
+        # claude-code-host and opencode are IN-CONTAINER CLIs (via docker
+        # exec, see container_agent_runner). They never run on the host: a
+        # host agent can walk up from its workspace into the benchmark repo
+        # and read projects/<task>/patch.diff (ground-truth patch) - observed
+        # in practice (mongoose/arvo_51757, 2026-10). The container is the
+        # sandbox; the agent only ever sees /src, /output and /work.
         if args.agent in ("claude-code-host", "opencode"):
-            isolated_host_work = Path(os.getenv("HOST_AGENT_WORK_ROOT", "/tmp")) / \
-                f"cybergym_{args.agent}_{os.getpid()}"
-            isolated_host_work.mkdir(parents=True, exist_ok=True)
-        if args.agent == "claude-code-host":
-            exit_code, host_patch, _out, _el = claude_host_runner.run_claude_on_host(
-                container_id=container_id,
-                repo_to_patch=config.get("repo_to_patch"),
-                prompt=prompt,
-                work_dir=(isolated_host_work if isolated_host_work else work_dir) / "host_workspace",
-                model=args.claude_host_model,
-                timeout=args.timeout,
-                wait_cycle=attempt,
-                log_path=str(log_file),
-            )
-        elif args.agent == "opencode":
-            exit_code, host_patch, _out, _el = opencode_host_runner.run_opencode_on_host(
-                container_id=container_id,
-                repo_to_patch=config.get("repo_to_patch"),
-                prompt=prompt,
-                work_dir=(isolated_host_work if isolated_host_work else work_dir) / "host_workspace",
-                model=args.opencode_model,
-                timeout=args.timeout,
-                wait_cycle=attempt,
-                log_path=str(log_file),
-            )
+            import container_agent_runner
+            if args.agent == "claude-code-host":
+                exit_code, _host_patch, _out, _el = container_agent_runner.run_claude_in_container(
+                    container_id=container_id,
+                    repo_to_patch=config.get("repo_to_patch"),
+                    prompt=prompt,
+                    model=args.claude_host_model,
+                    timeout=args.timeout,
+                    wait_cycle=attempt,
+                    log_path=str(log_file),
+                )
+            else:  # opencode
+                exit_code, _host_patch, _out, _el = container_agent_runner.run_opencode_in_container(
+                    container_id=container_id,
+                    repo_to_patch=config.get("repo_to_patch"),
+                    prompt=prompt,
+                    model=args.opencode_model,
+                    timeout=args.timeout,
+                    wait_cycle=attempt,
+                    log_path=str(log_file),
+                )
         elif args.agent == "claude-code":
             exit_code = _execute_claude_code(container_id, prompt, str(log_file), args)
         elif args.agent == "codex":
@@ -871,14 +883,12 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
             ["docker", "cp", f"{container_id}:/output/poc.bin", str(local_output / "poc.bin")],
             capture_output=True
         )
-        if args.agent in ("claude-code-host", "opencode"):
-            if host_patch and Path(host_patch).is_file():
-                shutil.copy(str(host_patch), str(local_output / "fix.patch"))
-        else:
-            subprocess.run(
-                ["docker", "cp", f"{container_id}:/output/fix.patch", str(local_output / "fix.patch")],
-                capture_output=True
-            )
+        # All agents write /output/fix.patch inside the task container
+        # (the in-container CLI agents do it via `git diff` after the run).
+        subprocess.run(
+            ["docker", "cp", f"{container_id}:/output/fix.patch", str(local_output / "fix.patch")],
+            capture_output=True
+        )
 
         poc_file = local_output / "poc.bin"
         patch_file = local_output / "fix.patch"
@@ -984,14 +994,6 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
             exit_code, poc_file, patch_file, log_file, agent_container_id, agent_exec_time = run_agent(
                 attempt_args, config, script_path, data_path, prompt, attempt, work_dir, trajectory_dir
             )
-
-            # Host-side workspaces live outside the repo (anti-cheat); drop the
-            # outer dir once the attempt is over (source tree is already gone
-            # from the runner's cleanup).
-            if args.agent in ("claude-code-host", "opencode"):
-                host_root = Path(os.getenv("HOST_AGENT_WORK_ROOT", "/tmp")) / \
-                    f"cybergym_{args.agent}_{os.getpid()}"
-                shutil.rmtree(host_root, ignore_errors=True)
 
             agent_time = time.time() - agent_start
             print(f"  Agent: {agent_time:.1f}s ({agent_time/60:.1f}m), exec: {agent_exec_time:.1f}s ({agent_exec_time/60:.1f}m), exit={exit_code}")
@@ -1143,8 +1145,11 @@ Examples:
     parser.add_argument("task_path", help="Task path (e.g., curl/arvo_66012)")
 
     # Agent selection
-    parser.add_argument("--agent", choices=["claude-code", "claude-code-host", "openhands", "codex", "gemini-cli", "opencode"], default="claude-code",
-                        help="Agent backend to use (default: claude-code)")
+    parser.add_argument("--agent", choices=["claude-code", "claude-code-host", "openhands", "codex",
+                                            "gemini-cli", "opencode"], default="claude-code",
+                        help="Agent backend to use (default: claude-code). claude-code-host and "
+                             "opencode run their CLI INSIDE the task container (anti-cheat: the "
+                             "agent cannot reach the benchmark repo).")
     parser.add_argument("--prompt-style", choices=["iterative", "no-test"], default="iterative",
                         help="Prompt style: iterative (can test) or no-test (default: iterative)")
 
@@ -1210,12 +1215,12 @@ Examples:
         if os.getenv("LITELLM_BASE_URL"):
             os.environ["GOOGLE_GEMINI_BASE_URL"] = os.getenv("LITELLM_BASE_URL")
 
-    # claude-code-host and opencode drive CLIs on the host directly (Claude
-    # subscription, kiconnect respectively), so the provider-derived model
-    # string is meaningless for them - reporting it would label results with
-    # a model that never ran.
+    # claude-code-host and opencode drive CLIs in the task container
+    # (Claude subscription, kiconnect respectively), so the provider-derived
+    # model string is meaningless for them - reporting it would label results
+    # with a model that never ran.
     if args.agent in ("claude-code-host", "opencode"):
-        llm_model = args.claude_host_model if args.agent == "claude-code-host" \
+        llm_model = args.claude_host_model if "claude" in args.agent \
             else f"kiconnect/{args.opencode_model}"
     else:
         _, llm_model = get_llm_env(

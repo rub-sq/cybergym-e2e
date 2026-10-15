@@ -4,11 +4,18 @@
 
 ## Running the benchmark (context)
 
-- `./run_dual_agents.sh` runs lanes: `openhands` (in-container, KIConnect via proxy), `opencode` (host CLI, KIConnect via proxy), `claude` (host CLI, subscription).
+- `./run_dual_agents.sh` runs lanes: `openhands`, `opencode`, `claude` — **every agent CLI runs INSIDE its task container** (`scripts/container_agent_runner.py`, driven by `docker exec`). There is no host-CLI mode anymore; this closes the GT-patch leak (host agents once cd'ed into the repo and read `patch.diff`).
 - KIConnect key-rotating proxy: `scripts/kiconnect_proxy.py` on port 8817, pools `KICONNECT_KEY1`/`KICONNECT_KEY2` from `.env`.
-- The opencode lane runs ON THE HOST: it must reach the proxy at `http://127.0.0.1:8817/v1` (the opencode binary's bun runtime cannot do outbound remote HTTPS from the host; `host.docker.internal` only exists inside containers).
-- The openhands lane runs IN containers: it reaches the proxy at `http://host.docker.internal:8817/v1`.
+- All lanes reach the proxy through the SAME container-side URL: `http://host.docker.internal:8817/v1` by default, **but on the tower (10.150.0.212) container→host-gateway traffic to the proxy port is REFUSED** — the only container-reachable address is the host LAN IP. Always launch on the tower with `OPENHANDS_PROXY_URL=http://10.150.0.212:8817/v1` (it is passed to every KIConnect lane, opencode included).
+- claude lane auth: the host's `~/.claude` subscription login is streamed into each task container per run (bulk session history excluded); `ANTHROPIC_API_KEY` in the environment is the fallback. If neither exists the lane dies with `CLAUDE_AUTH_ERROR`.
+- Before running the full bench on a new machine: `bash scripts/probe_opencode.sh` (host-side proxy round-trip) **and** `bash scripts/probe_opencode.sh --in-container` (the exact in-container path: install script, `su agent`, env file, container→proxy hop).
 - Task files use `project/tag` paths (e.g. `duckdb/arvo_56682`), data in `data/projects/<project>/<tag>/` (src.tgz, poc.bin, crash.log), configs in `projects/<project>/<tag>/`.
+
+## Tower (10.150.0.212) gotchas
+
+- SHARED machine: other users run their own KIConnect proxies (e.g. `phil`, CWE-inject, port 8818). Never trust `proxy.log` without checking the process `lstart` matches the bench launch time, and `ps aux | grep kiconnect_proxy` for impostors.
+- Verification gate after (re)launch: `POST /v1/chat/completions` lines must appear in `parallel_logs_dual/proxy.log` within ~5 minutes (openhands reaches it within ~2 min of a task start). Zero POST lines = agents never reached the LLM = results are meaningless `no_patch` (waste of hours).
+- 2026-09-28 incident: openhands spent the whole run hitting the refused host-gateway address (0 LLM calls, all `no_patch`); opencode lane produced real results but the same proxy logged 0 requests for its first ~5 tasks (root cause unconfirmed — v2 `opencode.db` state suspected; a from-scratch probe run with identical wiring routed through the proxy correctly). Clean relaunch + verification gate is the mitigation.
 
 ## Paper protocol (arXiv:2606.04460) — patch-only mode
 

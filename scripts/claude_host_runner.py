@@ -359,8 +359,12 @@ def write_patch(repo_dir, host_output):
     host_output.mkdir(parents=True, exist_ok=True)
     patch_path = host_output / "fix.patch"
 
+    # -c user.* fallback: in some images git refuses to run without a user
+    # identity; an empty diff here would be misread as "agent made no edits".
     result = subprocess.run(
-        ["git", "diff"], cwd=str(repo_dir), capture_output=True, text=True, check=False
+        ["git", "-c", "user.email=cybergym@localhost", "-c", "user.name=cybergym",
+         "diff"],
+        cwd=str(repo_dir), capture_output=True, text=True, check=False
     )
     if result.returncode == 0 and result.stdout.strip():
         patch_path.write_text(result.stdout, encoding="utf-8")
