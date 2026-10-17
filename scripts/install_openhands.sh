@@ -2,18 +2,33 @@
 
 # adapted from https://github.com/laude-institute/terminal-bench/blob/main/terminal_bench/agents/installed_agents/openhands/openhands-setup.sh.j2
 
+# The caller runs this with `bash -eux`. Network steps are retried: a single
+# dropped connection (curl 35 to releases.astral.sh) aborted whole attempts in
+# the 2026-10 qwen run. A bash loop, not curl --retry-all-errors, which older
+# task images do not support.
+retry() {
+    local i
+    for i in 1 2 3 4 5; do
+        "$@" && return 0
+        echo "retry $i/5 failed: $*" >&2
+        sleep 10
+    done
+    return 1
+}
+uv_install() { ( set -o pipefail; curl -LsSf https://astral.sh/uv/install.sh | sh ); }
+
 # Update package manager
 apt-get update
 
 apt-get install -y curl git build-essential tmux
 
-curl -LsSf https://astral.sh/uv/install.sh | sh
+retry uv_install
 
 # Add uv to PATH for current session
 source $HOME/.local/bin/env
 
 # Install Python 3.13 using uv
-uv python install 3.13
+retry uv python install 3.13
 
 # Create a dedicated virtual environment for OpenHands
 OPENHANDS_VENV="/opt/openhands-venv"
@@ -28,7 +43,7 @@ export SKIP_VSCODE_BUILD=true
 
 # Use 1.0.0 which has Claude Opus 4.5 fix
 # Staggered starts in batch_run.sh should avoid runtime contention issues
-uv pip install --prerelease=allow openhands-ai==1.0.0
+retry uv pip install --prerelease=allow openhands-ai==1.0.0
 
 # Fix Python 3.13 compatibility in binaryornot
 # The library has Python 2 code (unicode() builtin) that breaks on Python 3
