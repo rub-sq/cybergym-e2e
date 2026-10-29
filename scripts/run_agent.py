@@ -39,6 +39,7 @@ import tempfile
 from pathlib import Path
 
 import claude_host_runner
+import key_wait_clock
 import opencode_host_runner
 
 import tomli
@@ -49,8 +50,8 @@ from utils import (
     setup_workspace, get_llm_env, call_llm, get_poc_hex_dump, get_aws_credentials
 )
 
-# Default timeout in seconds (90 minutes)
-DEFAULT_TIMEOUT = 5400
+# Default budget per task in seconds (120 minutes), shared by every attempt
+DEFAULT_TIMEOUT = 7200
 
 
 # =============================================================================
@@ -576,13 +577,15 @@ def _execute_claude_code(container_id, prompt, output_file, args):
     return code
 
 
-def _execute_openhands(container_id, prompt, args):
+def _execute_openhands(container_id, prompt, args, base_url=None, timeout=None):
     """Execute OpenHands agent and return exit code and output.
     
     Args:
         container_id: Docker container ID (already set up with workspace)
         prompt: Prompt string for the agent
         args: Command line arguments
+        base_url: the run-scoped proxy URL, when the model calls go through kiconnect_proxy.py
+        timeout: the agent's outer time limit (default: args.timeout)
         
     Returns:
         tuple: (exit_code, stdout, stderr)
@@ -598,11 +601,13 @@ def _execute_openhands(container_id, prompt, args):
         aws_profile=args.aws_profile,
     )
 
+    if base_url:
+        env["OPENAI_BASE_URL"] = base_url
     code, stdout, stderr = exec_run(
         container_id,
         f"cd /opt && /opt/openhands-venv/bin/python -m openhands.core.main --task {escaped_prompt}",
         "Running agent",
-        timeout=args.timeout,
+        timeout=timeout or args.timeout,
         env=env,
     )
     
@@ -759,6 +764,18 @@ EOF''',
     return code
 
 
+def _kiconnect_proxy_url(args):
+    """The container-side URL of kiconnect_proxy.py when this lane's model calls go through it, else None."""
+    if args.agent == "opencode":
+        import container_agent_runner
+        url = container_agent_runner.container_proxy_url()
+    elif args.agent == "openhands" and args.model_provider == "kiconnect":
+        url = os.getenv("KICONNECT_BASE_URL")
+    else:
+        return None
+    return url if key_wait_clock.is_proxy(url) else None
+
+
 def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, trajectory_dir):
     """Unified agent execution workflow.
     
@@ -776,7 +793,7 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
         trajectory_dir: Directory for trajectory/log files
         
     Returns:
-        tuple: (exit_code, poc_file, patch_file, log_file, container_id, agent_exec_time)
+        tuple: (exit_code, poc_file, patch_file, log_file, container_id, agent_exec_time, key_wait_seconds)
     """
     scripts_dir = Path(__file__).parent.absolute()
     build_image = config.get("build_image", args.default_build_image)
@@ -831,48 +848,70 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
         # Execute agent
         log_file = trajectory_dir / f"attempt_{attempt}.log"
 
+        # A lane whose model calls go through kiconnect_proxy.py tags them with
+        # this attempt's run id; the time they wait for a key is kept off the
+        # agent's clock, which then ends the agent instead of its own timeout.
+        proxy_url = _kiconnect_proxy_url(args)
+        clock = None
+        agent_timeout = args.timeout
+        agent_base_url = None
+        if proxy_url:
+            run_id = key_wait_clock.new_run_id(f"{config.get('repo_to_patch') or 'task'}-a{attempt}")
+            agent_base_url = key_wait_clock.run_url(proxy_url, run_id)
+            agent_timeout = args.timeout + key_wait_clock.MAX_KEY_WAIT_S
+            clock = key_wait_clock.AgentClock(container_id, proxy_url, run_id, allowance_s=args.timeout)
+
         agent_exec_start = time.time()
-        # claude-code-host and opencode are IN-CONTAINER CLIs (via docker
-        # exec, see container_agent_runner). They never run on the host: a
-        # host agent can walk up from its workspace into the benchmark repo
-        # and read projects/<task>/patch.diff (ground-truth patch) - observed
-        # in practice (mongoose/arvo_51757, 2026-10). The container is the
-        # sandbox; the agent only ever sees /src, /output and /work.
-        if args.agent in ("claude-code-host", "opencode"):
-            import container_agent_runner
-            if args.agent == "claude-code-host":
-                exit_code, _host_patch, _out, _el = container_agent_runner.run_claude_in_container(
-                    container_id=container_id,
-                    repo_to_patch=config.get("repo_to_patch"),
-                    prompt=prompt,
-                    model=args.claude_host_model,
-                    timeout=args.timeout,
-                    wait_cycle=attempt,
-                    log_path=str(log_file),
+        if clock:
+            clock.start()
+        key_wait = 0.0
+        try:
+            # claude-code-host and opencode are IN-CONTAINER CLIs (via docker
+            # exec, see container_agent_runner). They never run on the host: a
+            # host agent can walk up from its workspace into the benchmark repo
+            # and read projects/<task>/patch.diff (ground-truth patch) - observed
+            # in practice (mongoose/arvo_51757, 2026-10). The container is the
+            # sandbox; the agent only ever sees /src, /output and /work.
+            if args.agent in ("claude-code-host", "opencode"):
+                import container_agent_runner
+                if args.agent == "claude-code-host":
+                    exit_code, _host_patch, _out, _el = container_agent_runner.run_claude_in_container(
+                        container_id=container_id,
+                        repo_to_patch=config.get("repo_to_patch"),
+                        prompt=prompt,
+                        model=args.claude_host_model,
+                        timeout=agent_timeout,
+                        wait_cycle=attempt,
+                        log_path=str(log_file),
+                    )
+                else:  # opencode
+                    exit_code, _host_patch, _out, _el = container_agent_runner.run_opencode_in_container(
+                        container_id=container_id,
+                        repo_to_patch=config.get("repo_to_patch"),
+                        prompt=prompt,
+                        model=args.opencode_model,
+                        timeout=agent_timeout,
+                        wait_cycle=attempt,
+                        log_path=str(log_file),
+                        base_url=agent_base_url,
+                    )
+            elif args.agent == "claude-code":
+                exit_code = _execute_claude_code(container_id, prompt, str(log_file), args)
+            elif args.agent == "codex":
+                exit_code = _execute_codex(container_id, prompt, str(log_file), args)
+            elif args.agent == "gemini-cli":
+                exit_code = _execute_gemini_cli(container_id, prompt, str(log_file), args)
+            else:  # openhands
+                exit_code, stdout, stderr = _execute_openhands(container_id, prompt, args,
+                                                               base_url=agent_base_url, timeout=agent_timeout)
+                # OpenHands may have separate trajectory files
+                subprocess.run(
+                    ["docker", "cp", f"{container_id}:/agent_trajectory/.", str(trajectory_dir)],
+                    capture_output=True
                 )
-            else:  # opencode
-                exit_code, _host_patch, _out, _el = container_agent_runner.run_opencode_in_container(
-                    container_id=container_id,
-                    repo_to_patch=config.get("repo_to_patch"),
-                    prompt=prompt,
-                    model=args.opencode_model,
-                    timeout=args.timeout,
-                    wait_cycle=attempt,
-                    log_path=str(log_file),
-                )
-        elif args.agent == "claude-code":
-            exit_code = _execute_claude_code(container_id, prompt, str(log_file), args)
-        elif args.agent == "codex":
-            exit_code = _execute_codex(container_id, prompt, str(log_file), args)
-        elif args.agent == "gemini-cli":
-            exit_code = _execute_gemini_cli(container_id, prompt, str(log_file), args)
-        else:  # openhands
-            exit_code, stdout, stderr = _execute_openhands(container_id, prompt, args)
-            # OpenHands may have separate trajectory files
-            subprocess.run(
-                ["docker", "cp", f"{container_id}:/agent_trajectory/.", str(trajectory_dir)],
-                capture_output=True
-            )
+        finally:
+            if clock:
+                key_wait = clock.stop()
         agent_exec_time = time.time() - agent_exec_start
 
         # Copy output files from container
@@ -893,32 +932,32 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
         poc_file = local_output / "poc.bin"
         patch_file = local_output / "fix.patch"
 
-        return exit_code, poc_file, patch_file, log_file, container_id, agent_exec_time
+        return exit_code, poc_file, patch_file, log_file, container_id, agent_exec_time, key_wait
 
     except claude_host_runner.ClaudeQuotaExhausted as e:
         # Emit a machine-readable marker so an orchestrator can sleep exactly
         # until the subscription window reopens instead of blind polling.
         print(f"CLAUDE_QUOTA_EXHAUSTED wake_at={e.wake_at.isoformat()}")
         print(f"  Claude quota exhausted; resume at {e.wake_at.isoformat()}")
-        return 125, None, None, None, container_id, 0
+        return 125, None, None, None, container_id, 0, 0.0
     except claude_host_runner.ClaudeAuthError as e:
         print(f"CLAUDE_AUTH_ERROR {e}")
-        return 126, None, None, None, container_id, 0
+        return 126, None, None, None, container_id, 0, 0.0
     except opencode_host_runner.OpencodeQuotaExhausted as e:
         # Same marker the claude lane uses: the orchestrator's QUOTA_MARKER
         # picks it up and sleeps until the proxy pool frees a key.
         print(f"CLAUDE_QUOTA_EXHAUSTED wake_at={e.wake_at.isoformat()}")
         print(f"  opencode/kiconnect quota exhausted; resume at {e.wake_at.isoformat()}")
-        return 125, None, None, None, container_id, 0
+        return 125, None, None, None, container_id, 0, 0.0
     except opencode_host_runner.OpencodeAuthError as e:
         print(f"OPENCODE_AUTH_ERROR {e}")
-        return 126, None, None, None, container_id, 0
+        return 126, None, None, None, container_id, 0, 0.0
     except Exception as e:
         print(f"  Agent execution error: {e}")
         import traceback
         traceback.print_exc()
         # Return container_id so caller can clean it up
-        return 1, None, None, None, container_id, 0
+        return 1, None, None, None, container_id, 0, 0.0
 
 
 # =============================================================================
@@ -941,16 +980,14 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
     validation_containers = []
     agent_container_id = None
 
-    # --timeout is the TOTAL agent budget per task, shared across all
-    # attempts (paper protocol: 90 minutes + at most 2 attempts). Each
-    # attempt gets what is left, minus a margin for container setup so the
-    # total wall time stays near the budget; an attempt only runs if it can
-    # get a meaningful slice of the remainder.
-    SETUP_MARGIN = 900
+    # --timeout is the TOTAL budget per task, shared by every attempt. It counts
+    # what the attempts spend working: the agent's run, minus its waits for a
+    # model key, and the validation that builds and tests each patch. Starting
+    # the container, preparing the workspace and installing the agent do not
+    # count. An attempt gets what is left and runs only if that is a meaningful
+    # slice; a validation that starts in time always finishes.
     MIN_ATTEMPT = 600
-    # Agent-phase budget only: container setup + agent execution. The
-    # harness's own validation builds are infrastructure time, not agent time.
-    budget_start = time.time()
+    charged = 0.0
 
     try:
         for attempt in range(1, args.max_attempts + 1):
@@ -961,10 +998,9 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
                 cleanup_container(agent_container_id)
                 agent_container_id = None
 
-            per_attempt = max(0, int(args.timeout - (time.time() - budget_start) - SETUP_MARGIN))
+            per_attempt = max(0, int(args.timeout - charged))
             if per_attempt < MIN_ATTEMPT:
-                used = time.time() - budget_start
-                print(f"  Budget exhausted ({used:.0f}s of {args.timeout}s used); "
+                print(f"  Budget exhausted ({charged:.0f}s of {args.timeout}s used); "
                       f"skipping attempt {attempt}")
                 all_attempts.append({
                     "attempt": attempt,
@@ -974,12 +1010,13 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
                     "stage3": "skipped",
                     "stage4": "skipped",
                     "success": False,
+                    "budget_charged_seconds": round(charged, 1),
                 })
                 break
 
             print(f"\n{'='*60}")
             print(f"ATTEMPT {attempt}/{args.max_attempts} "
-                  f"(budget left {per_attempt + SETUP_MARGIN:.0f}s)")
+                  f"(budget left {per_attempt}s)")
             print(f"{'='*60}\n")
 
             attempt_args = argparse.Namespace(**vars(args))
@@ -991,12 +1028,14 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
             work_dir = run_dir / f"workspace_attempt_{attempt}"
             work_dir.mkdir(parents=True, exist_ok=True)
 
-            exit_code, poc_file, patch_file, log_file, agent_container_id, agent_exec_time = run_agent(
+            exit_code, poc_file, patch_file, log_file, agent_container_id, agent_exec_time, key_wait = run_agent(
                 attempt_args, config, script_path, data_path, prompt, attempt, work_dir, trajectory_dir
             )
+            charged += max(0.0, agent_exec_time - key_wait)
 
             agent_time = time.time() - agent_start
-            print(f"  Agent: {agent_time:.1f}s ({agent_time/60:.1f}m), exec: {agent_exec_time:.1f}s ({agent_exec_time/60:.1f}m), exit={exit_code}")
+            print(f"  Agent: {agent_time:.1f}s ({agent_time/60:.1f}m), exec: {agent_exec_time:.1f}s ({agent_exec_time/60:.1f}m), "
+                  f"key waits: {key_wait:.0f}s, exit={exit_code}")
 
             # Check for generated files (poc/patch are None on early quota exits)
             if args.mode == "e2e" and not (poc_file and poc_file.exists()):
@@ -1004,11 +1043,13 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
                 all_attempts.append({
                     "attempt": attempt,
                     "agent_exec_seconds": round(agent_exec_time, 2),
+                    "key_wait_seconds": round(key_wait, 1),
                     "stage1": "no_poc",
                     "stage2": "skipped",
                     "stage3": "skipped",
                     "stage4": "skipped",
                     "success": False,
+                    "budget_charged_seconds": round(charged, 1),
                 })
                 if attempt < args.max_attempts:
                     feedback = "\n=== Previous Attempt Failed ===\nNo poc.bin was generated."
@@ -1019,11 +1060,13 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
                 all_attempts.append({
                     "attempt": attempt,
                     "agent_exec_seconds": round(agent_exec_time, 2),
+                    "key_wait_seconds": round(key_wait, 1),
                     "stage1": "skipped",
                     "stage2": "skipped",
                     "stage3": "no_patch",
                     "stage4": "skipped",
                     "success": False,
+                    "budget_charged_seconds": round(charged, 1),
                 })
                 if attempt < args.max_attempts:
                     feedback = "\n=== Previous Attempt Failed ===\nNo fix.patch was generated."
@@ -1057,7 +1100,8 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
                 mode=args.mode,
             )
             validation_time = time.time() - validation_start
-            print(f"  Validation: {validation_time:.1f}s")
+            charged += validation_time
+            print(f"  Validation: {validation_time:.1f}s (budget used {charged:.0f}s of {args.timeout}s)")
 
             # Check results
             if args.mode == "e2e":
@@ -1075,6 +1119,9 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
             attempt_result = {
                 "attempt": attempt,
                 "agent_exec_seconds": round(agent_exec_time, 2),
+                "key_wait_seconds": round(key_wait, 1),
+                "validation_seconds": round(validation_time, 1),
+                "budget_charged_seconds": round(charged, 1),
                 "stage1": results.get("stage1") if args.mode == "e2e" else None,
                 "stage2": results.get("stage2") if args.mode == "e2e" else None,
                 "stage3": results.get("stage3"),
@@ -1265,6 +1312,8 @@ Examples:
         "timeout": args.timeout,
         "status": final_status,
         "attempts": all_attempts,
+        # what the budget counted: agent runs minus key waits, plus validation builds
+        "budget_charged_seconds": max([a.get("budget_charged_seconds") or 0 for a in all_attempts] or [0]),
         "duration_seconds": duration,
         "duration_minutes": round(duration / 60, 2),
         "output_dir": str(run_dir.absolute()),

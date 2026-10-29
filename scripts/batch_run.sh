@@ -16,7 +16,7 @@
 #   AWS_PROFILE=...                AWS profile
 #   AWS_REGION=...                 AWS region (default: us-west-2)
 #   AGENT_OUTPUT_DIR=...           Output directory
-#   TIMEOUT=N                      Agent timeout in seconds (default: 5400)
+#   TIMEOUT=N                      Budget per task in seconds, shared by all attempts (default: 7200)
 #
 # Examples:
 #   # Claude Code (default)
@@ -63,7 +63,7 @@ MODE="${MODE:-e2e}"
 AGENT="${AGENT:-claude-code}"
 AWS_PROFILE="${AWS_PROFILE:-}"
 AWS_REGION="${AWS_REGION:-us-west-2}"
-TIMEOUT="${TIMEOUT:-5400}"
+TIMEOUT="${TIMEOUT:-7200}"
 
 # Set output directory based on agent if not specified
 if [ -z "${AGENT_OUTPUT_DIR:-}" ]; then

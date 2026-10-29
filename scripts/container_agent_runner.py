@@ -312,8 +312,9 @@ def _opencode_config(model: str, base_url: str) -> str:
 
 
 def run_opencode_in_container(container_id, repo_to_patch, prompt, model,
-                              timeout=3600, wait_cycle=1, log_path=None):
-    """Run the opencode CLI inside the task container.
+                              timeout=3600, wait_cycle=1, log_path=None, base_url=None):
+    """Run the opencode CLI inside the task container. base_url overrides the proxy URL (a run-scoped one
+    carries the run's id, see key_wait_clock).
 
     Returns (exit_code, patch_host_path_or_None, log_text, elapsed).
     Raises OpencodeQuotaExhausted / OpencodeAuthError exactly like
@@ -324,7 +325,7 @@ def run_opencode_in_container(container_id, repo_to_patch, prompt, model,
 
     # 1. Config (base URL = proxy as seen from inside the container) and
     #    prompt as files - nothing shell-interpolated at exec time.
-    base_url = container_proxy_url()
+    base_url = base_url or container_proxy_url()
     _write_container_file(container_id, f"{WORKDIR}/opencode.json",
                           _opencode_config(model, base_url))
     _write_container_file(container_id, f"{WORKDIR}/.prompt.txt", prompt)

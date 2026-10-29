@@ -12,6 +12,11 @@ Two different 429s must not be confused:
     Transient - briefly back off and reuse the same key.
   * quota / message-limit language means the key's window is spent.
     Lock it for --lock-seconds and move to the next key.
+
+A request whose path starts with /run/<run id> belongs to that run: the time it spends waiting
+for a key (a pool where every key is busy or locked, or a concurrency back-off) is added to the
+run's total, which GET /_waits/<run id> returns. Waiting for a key is not time an agent spends
+working, so the harness keeps it off the agent's clock (key_wait_clock.py).
 """
 
 import argparse
@@ -51,6 +56,8 @@ AUTH_PATTERNS = (
     r"api key (?:is )?(?:invalid|missing|required)",
     r"no api key",
 )
+
+RUN_PATH_RE = re.compile(r"^/run/([A-Za-z0-9_.-]{1,128})(/.*)?$")
 
 QUOTA_RE = re.compile("|".join(QUOTA_PATTERNS), re.IGNORECASE)
 CONCURRENCY_RE = re.compile("|".join(CONCURRENCY_PATTERNS), re.IGNORECASE)
@@ -316,12 +323,55 @@ class KeyPool:
             return out
 
 
+class RunWaits:
+    """Per run, the time at least one of its requests was waiting for a key. Overlapping waits count
+    once: the run is waiting, however many of its requests are."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._waiting = {}
+        self._since = {}
+        self._total = {}
+
+    def begin(self, run):
+        if not run:
+            return
+        with self._lock:
+            if self._waiting.get(run, 0) == 0:
+                self._since[run] = time.monotonic()
+            self._waiting[run] = self._waiting.get(run, 0) + 1
+
+    def end(self, run):
+        if not run:
+            return
+        with self._lock:
+            self._waiting[run] -= 1
+            if self._waiting[run] == 0:
+                self._total[run] = self._total.get(run, 0.0) + time.monotonic() - self._since.pop(run)
+
+    def seconds(self, run):
+        with self._lock:
+            total = self._total.get(run, 0.0)
+            if self._waiting.get(run, 0):
+                total += time.monotonic() - self._since[run]
+            return total
+
+
+def split_run(path):
+    """(run id or None, path without the /run/<id> prefix)."""
+    m = RUN_PATH_RE.match(path)
+    if not m:
+        return None, path
+    return m.group(1), m.group(2) or "/"
+
+
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] proxy: {msg}", flush=True)
 
 
 class Handler(BaseHTTPRequestHandler):
     pool = None
+    waits = RunWaits()
     upstream = UPSTREAM_DEFAULT
     max_attempts = 12
 
@@ -329,7 +379,17 @@ class Handler(BaseHTTPRequestHandler):
         pass  # our own logging only
 
     def do_GET(self):
-        if self.path.rstrip("/") == "/_pool":
+        _, path = split_run(self.path)  # a run-scoped client asks the same endpoints
+        if path.startswith("/_waits/"):
+            run = path[len("/_waits/"):].strip("/")
+            payload = json.dumps({"run": run, "seconds": round(self.waits.seconds(run), 3)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if path.rstrip("/") == "/_pool":
             payload = json.dumps(self.pool.status(), indent=2).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -344,7 +404,8 @@ class Handler(BaseHTTPRequestHandler):
         self._proxy(self.rfile.read(length) if length else b"")
 
     def _proxy(self, body):
-        suffix = self.path.replace("/v1", "", 1)
+        run, path = split_run(self.path)
+        suffix = path.replace("/v1", "", 1)
         body, translate_back, requested_model = self._adapt_body(body)
         if translate_back:
             # chat-completions in, /responses out; the reply is converted back
@@ -352,11 +413,14 @@ class Handler(BaseHTTPRequestHandler):
             suffix = "/responses"
         target = self.upstream.rstrip("/") + suffix
         for attempt in range(1, self.max_attempts + 1):
+            self.waits.begin(run)
             try:
                 key = self.pool.acquire(model=requested_model or "")
             except TimeoutError:
                 self._fail(503, "no key available")
                 return
+            finally:
+                self.waits.end(run)
             try:
                 status, text, headers = self._forward(target, body, key)
             finally:
@@ -380,7 +444,11 @@ class Handler(BaseHTTPRequestHandler):
             if verdict == "concurrency":
                 wait = min(30, 2 ** min(attempt, 4))
                 log(f"concurrency cap on {key.split(':')[0][:8]}; retry in {wait}s")
-                time.sleep(wait)
+                self.waits.begin(run)
+                try:
+                    time.sleep(wait)
+                finally:
+                    self.waits.end(run)
                 continue
             self._respond(status, text, headers)
             return
