@@ -6,9 +6,12 @@
 #           opencode    -> opencode CLI, also through the proxy
 #
 # Every agent CLI runs INSIDE its task container (anti-cheat: the agent can
-# never see the benchmark repo on the host). The only host-side state is the
-# KIConnect proxy and, for claude, the ~/.claude subscription login that gets
-# streamed into each container (or ANTHROPIC_API_KEY in the environment).
+# never see the benchmark repo on the host), and the container is locked to
+# its model endpoint before the agent starts (scripts/sandbox.py): no GitHub,
+# no package registry, no DNS. The only host-side state is the KIConnect
+# proxy and, for claude, the subscription login: CLAUDE_CODE_OAUTH_TOKEN
+# (`claude setup-token`), else the host's own login (the credentials file
+# on Linux, the Keychain on macOS), else ANTHROPIC_API_KEY.
 #
 # Every lane runs one task at a time and blocks independently: OpenHands or
 # opencode waiting on KIConnect quota does not stall Claude, and Claude
@@ -48,9 +51,9 @@ export NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost"
 KICONNECT_KEY1="${1:-${KICONNECT_KEY1:-}}"
 KICONNECT_KEY2="${2:-${KICONNECT_KEY2:-}}"
 # The proxy rotates across every pooled key, but a model id is only valid on
-# the account it belongs to (mistral's ki.inferenz.nrw-... id lives on KEY2;
-# run_920_tasks.sh ran its Mistral batch on KEY2 alone). KICONNECT_KEY2_ONLY=1
-# pools KEY2 only, otherwise requests landing on KEY1 get "model does not exist".
+# the account it belongs to (mistral's ki.inferenz.nrw-... id lives on KEY2).
+# KICONNECT_KEY2_ONLY=1 pools KEY2 only, otherwise requests landing on KEY1
+# get "model does not exist".
 if [[ "${KICONNECT_KEY2_ONLY:-0}" == "1" ]]; then
     KICONNECT_KEY1="$KICONNECT_KEY2"; KICONNECT_KEY2=""
 fi
@@ -135,8 +138,9 @@ if [[ "$want_openhands" == "1" ]]; then
     done
 fi
 # claude and opencode run INSIDE their task containers:
-#  - claude needs the host's ~/.claude subscription login (streamed into the
-#    container per run) or ANTHROPIC_API_KEY in the environment.
+#  - claude logs in with CLAUDE_CODE_OAUTH_TOKEN, the host's own login
+#    (~/.claude/.credentials.json on Linux, the Keychain on macOS; only
+#    the login is copied in) or ANTHROPIC_API_KEY.
 #  - opencode reaches the proxy through the same container-side URL as
 #    openhands (the --proxy-url above).
 [[ "$want_claude" == "1" ]] && ORCH_ARGS+=(--claude --claude-model "$CLAUDE_MODEL")
@@ -147,6 +151,20 @@ if [[ "$want_opencode" == "1" ]]; then
         ORCH_ARGS+=(--opencode-model "$(echo "$_m" | xargs)")
     done
 fi
+
+# Preflight: lock a scratch container exactly as every agent's container is
+# locked, and verify that nothing but the lanes' model endpoints answers
+# (scripts/sandbox.py). The bench does not start otherwise.
+CHECK_ARGS=()
+[[ "$want_proxy" == "1" ]] && CHECK_ARGS+=(--allow "${OPENHANDS_PROXY_URL:-http://host.docker.internal:$PROXY_PORT/v1}")
+[[ "$want_claude" == "1" ]] && CHECK_ARGS+=(--allow "${ANTHROPIC_BASE_URL:-https://api.anthropic.com}")
+echo "network check (a scratch container, locked like an agent's) ..."
+if ! python3 scripts/sandbox.py --check "${CHECK_ARGS[@]}" > "$LOG_DIR/network_check.log" 2>&1; then
+    echo "ERROR: the network check failed - see $LOG_DIR/network_check.log"
+    tail -20 "$LOG_DIR/network_check.log"
+    exit 1
+fi
+echo "network check passed ($(grep -c '^ok:' "$LOG_DIR/network_check.log") checks)"
 
 echo ""
 python3 scripts/dual_agent_orchestrator.py "${ORCH_ARGS[@]}"

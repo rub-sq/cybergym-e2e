@@ -1,45 +1,32 @@
 #!/bin/bash
-# Install the opencode CLI inside a task container so the opencode lane can
-# run in-container (see container_agent_runner.py) instead of on the host.
+# Install the opencode CLI inside a task container (see container_agent_runner.py).
 #
-# The in-container build is a single static binary (no npm), so there is no
-# bun-runtime outbound-HTTPS quirk that forced the host lane onto loopback.
+# The release is OPENCODE_VERSION, set by run_agent.py. OpenCode 2 has its own installer
+# (opencode.ai/v2/install); the old opencode.ai/install only brings 1.x. The binary lands in root's
+# home and is copied onto the system PATH for the unprivileged agent user. ripgrep is installed up
+# front because opencode's grep and glob tools run it and would otherwise download it on first use,
+# which the closed network forbids (scripts/sandbox.py).
 
 set -eux
 
 apt-get update
 apt-get install -y curl git ca-certificates
+apt-get install -y ripgrep || {
+    # Older task images have no ripgrep package: take the static release.
+    curl -fsSL https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz \
+        | tar -xz -C /tmp
+    install -m 755 /tmp/ripgrep-14.1.1-x86_64-unknown-linux-musl/rg /usr/local/bin/rg
+}
 
-# Static single-file binary. The installer targets the calling user's home
-# ($HOME/.opencode/bin), which here is /root; the agent runs as the
-# unprivileged `agent` user, so expose the binary system-wide on PATH.
-# Retry: a single dropped connection to opencode.ai (curl 35) cost two attempts
-# in the 2026-10 mistral run. pipefail in the subshell so a failed download is
-# not masked by bash exiting 0 on empty input; a bash loop instead of curl's
-# --retry-all-errors, which older task images (curl < 7.71) do not know.
+# Retried: a single dropped connection to opencode.ai (curl 35) cost two attempts once. pipefail in
+# the subshell so a failed download is not masked by bash exiting 0 on empty input; a bash loop
+# instead of curl's --retry-all-errors, which older task images (curl < 7.71) do not know.
 for i in 1 2 3 4 5; do
-    ( set -o pipefail; curl -fsSL https://opencode.ai/install | bash ) && break
+    ( set -o pipefail; curl -fsSL https://opencode.ai/v2/install | VERSION="${OPENCODE_VERSION:?}" bash ) && break
     echo "opencode installer failed (try $i/5); retrying in 10s" >&2
     sleep 10
 done
 
-OC_BIN="$(command -v opencode || true)"
-if [[ -z "$OC_BIN" && -x "$HOME/.opencode/bin/opencode" ]]; then
-    OC_BIN="$HOME/.opencode/bin/opencode"
-fi
-if [[ -z "$OC_BIN" ]]; then
-    echo "ERROR: opencode binary not found after install" >&2
-    exit 1
-fi
-cp -f "$OC_BIN" /usr/local/bin/opencode
-chmod 755 /usr/local/bin/opencode
-
-# The runner invokes the CLI as the unprivileged `agent` user (created by
-# run_agent.install for other lanes); make sure it exists here too.
-useradd -m -s /bin/bash agent 2>/dev/null || true
-mkdir -p /work /output
-chown -R agent:agent /src /output /work 2>/dev/null || true
-
-# Verify it lands on PATH for the unprivileged user.
-command -v opencode
+install -m 755 "$HOME/.opencode/bin/opencode" /usr/local/bin/opencode
 opencode --version
+rg --version | head -1

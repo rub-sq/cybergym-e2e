@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
-"""Run a host-CLI agent (opencode, claude) INSIDE the task container.
+"""Run a CLI agent (opencode, claude) INSIDE the task container.
 
-The host-based runners (claude_host_runner / opencode_host_runner) export the
-source tree out of the container, let a host-side CLI edit it, and diff it.
-That works, but a host agent can walk up from its workspace into the benchmark
-repo and read projects/<task>/patch.diff (ground-truth patch) - observed in
-practice (mongoose/arvo_51757, 2026-10).
+The CLI is driven with `docker exec` against the already-set-up task container (/src holds the
+source, /output the results dir), as the unprivileged agent user, so the agent never sees anything
+outside its container: a CLI on the host could walk up from its workspace into this repository and
+read projects/<task>/patch.diff, the ground-truth patch, and one did. By the time a runner starts,
+run_agent.py has closed the container's network to the lane's model endpoint (scripts/sandbox.py).
+The container's baseline git commit (made by setup_workspace) means `git diff` in the repository
+yields the patch.
 
-These runners instead drive the same CLI with `docker exec` against the
-already-set-up task container (/src holds the source, /output the results
-dir), so the agent never sees anything outside its container. The container's
-baseline git commit (made by setup_workspace) means `git diff` in the repo
-directory yields the patch, exactly like the host runners.
-
-opencode additionally talks to the KIConnect proxy through the same address
-the OpenHands lane already uses: start_container() maps host.docker.internal
-to host-gateway, and on hosts where host-gateway is refused (the tower) the
-operator overrides with OPENHANDS_PROXY_URL (host LAN IP) - this module
-reuses that variable so there is one knob per host.
+opencode talks to the KIConnect proxy through the address the OpenHands lane uses: start_container()
+maps host.docker.internal to host-gateway, and on hosts where host-gateway is refused (the tower) the
+operator overrides it with OPENHANDS_PROXY_URL (the host's LAN IP); this module reuses that variable,
+so there is one knob per host.
 """
 
 from __future__ import annotations
@@ -26,29 +21,32 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from utils import exec_run
-from claude_host_runner import (
-    ClaudeQuotaExhausted,
+from cli_failures import (
     ClaudeAuthError,
-    compute_wake_at,
-    classify_output as classify_claude_output,
-)
-from opencode_host_runner import (
-    OpencodeQuotaExhausted,
+    ClaudeQuotaExhausted,
     OpencodeAuthError,
-    _pool_lock_seconds,
-    classify_output as classify_opencode_output,
+    OpencodeQuotaExhausted,
+    classify_claude_output,
+    classify_opencode_output,
+    compute_wake_at,
+    pool_lock_seconds,
 )
 
-AGENT_USER = "agent"          # created by install() in run_agent.py
+AGENT_USER = "agent"          # created by run_agent._restrict_files
 WORKDIR = "/work"
 # `su` runs a login shell that DROPS the environment docker exec passes in,
-# so per-run variables (API key, OPENCODE_CONFIG) are written to a file the
-# agent user reads, and `source`d inside the su'd command.
+# so per-run variables (OPENCODE_CONFIG, the claude login token) are written
+# to a file the agent user reads, and `source`d inside the su'd command.
 ENV_FILE = f"{WORKDIR}/agent.env"
+# What a client in the container sends as its KIConnect key. The proxy owns the real keys and sets
+# Authorization itself; the placeholder only has to look like a key (id:secret), because opencode 2
+# rejects a value of another shape before sending anything.
+PROXY_KEY_PLACEHOLDER = "proxy-managed:not-a-real-key"
 
 
 def container_proxy_url() -> str:
@@ -81,8 +79,7 @@ def _write_env_file(container_id, env):
     """
     lines = [
         "export HOME=/home/agent",
-        "export PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin:"
-        "/root/.opencode/bin:$PATH",
+        "export PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH",
     ]
     lines += [f"export {k}={shlex.quote(str(v))}" for k, v in env.items()]
     _write_container_file(container_id, ENV_FILE, "\n".join(lines))
@@ -138,84 +135,75 @@ def _extract_patch(container_id, repo_dir):
 
 
 # --- claude-in-container -----------------------------------------------------
-def _claude_home() -> Path:
-    """Host-side Claude Code state (subscription OAuth credentials live here)."""
-    return Path(os.path.expanduser("~/.claude"))
+def _host_claude_credentials() -> str | None:
+    """The subscription login of the host's Claude Code, as the JSON its credentials file holds.
 
-
-def _copy_claude_home(container_id) -> bool:
-    """Stream the host's ~/.claude into the container for the agent user.
-
-    Session history (projects/, shell snapshots) is excluded: it is bulky,
-    machine-specific and useless inside a fresh container. The agent user's
-    HOME is /home/agent (created by useradd -m in install), and the run
-    command sets HOME to match so the CLI finds its state.
+    Linux keeps it in ~/.claude/.credentials.json, macOS in the user's login Keychain.
     """
-    home = _claude_home()
-    code, _, stderr = exec_run(container_id,
-                               f"mkdir -p /home/{AGENT_USER}/.claude",
-                               "mkdir .claude in container", verbose=False)
-    if code != 0:
-        raise ClaudeAuthError(f"could not prepare .claude dir: {stderr[-200:]}")
-    tar = subprocess.Popen(
-        ["tar", "-C", str(home),
-         "--exclude=projects", "--exclude=shell-snapshots", "--exclude=todos",
-         "-cf", "-", "."],
-        stdout=subprocess.PIPE,
+    credentials = Path(os.path.expanduser("~/.claude/.credentials.json"))
+    if credentials.is_file():
+        return credentials.read_text(encoding="utf-8")
+    if sys.platform == "darwin":
+        found = subprocess.run(["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                               capture_output=True, text=True)
+        if found.returncode == 0 and found.stdout.strip():
+            return found.stdout.strip()
+    return None
+
+
+def _copy_claude_credentials(container_id) -> bool:
+    """Give the agent user the host's subscription login, and nothing else of ~/.claude.
+
+    The rest of ~/.claude is the host user's own: prompt history of every project, plans, settings,
+    memory files. The login goes through stdin, so it is never written to a file on the host.
+    """
+    credentials = _host_claude_credentials()
+    if not credentials:
+        return False
+    home = f"/home/{AGENT_USER}/.claude"
+    written = subprocess.run(
+        ["docker", "exec", "-i", container_id, "sh", "-c",
+         f"mkdir -p {home} && umask 077 && cat > {home}/.credentials.json && "
+         f"chown -R {AGENT_USER}:{AGENT_USER} {home}"],
+        input=credentials, text=True, capture_output=True,
     )
-    docker = subprocess.Popen(
-        ["docker", "exec", "-i", container_id,
-         "tar", "-xf", "-", "-C", f"/home/{AGENT_USER}/.claude"],
-        stdin=tar.stdout,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    tar.stdout.close()
-    ok = docker.wait() == 0 and tar.wait() == 0
-    if ok:
-        exec_run(container_id,
-                 f"chown -R {AGENT_USER}:{AGENT_USER} /home/{AGENT_USER}/.claude",
-                 "chown .claude in container", verbose=False)
-    return ok
+    return written.returncode == 0
 
 
 def run_claude_in_container(container_id, repo_to_patch, prompt, model,
                             timeout=3600, wait_cycle=1, log_path=None):
     """Run the claude CLI inside the task container.
 
-    Returns (exit_code, patch_host_path_or_None, log_text, elapsed).
-    Raises ClaudeQuotaExhausted / ClaudeAuthError exactly like
-    claude_host_runner.run_claude_on_host, so the orchestrator's existing
-    lane logic (quota sleep, auth stop) handles both identically.
+    Returns (exit_code, None, log_text, 0); the patch is left at /output/fix.patch.
+    Raises ClaudeQuotaExhausted / ClaudeAuthError, which the orchestrator turns
+    into a quota sleep or a stopped lane.
 
-    Authentication: the subscription login on this host (~/.claude) is
-    streamed into the container. ANTHROPIC_API_KEY in the runner environment
-    is the fallback when no host login exists (bills the API instead of the
-    subscription; the host runner deliberately avoids that, but in-container
-    there is no other way to authenticate).
+    Authentication, first match wins: CLAUDE_CODE_OAUTH_TOKEN (a long-lived subscription token from
+    `claude setup-token`, nothing to refresh), the host's subscription login (its credentials file, or
+    the Keychain on macOS), ANTHROPIC_API_KEY (bills the API instead of the subscription).
     """
     repo_dir = f"/src/{repo_to_patch}" if repo_to_patch else "/src"
 
-    # 1. Provision auth: copy the host subscription, else inject an API key.
+    # 1. Provision auth. The container reaches only the Anthropic API (and its login host, for a
+    #    token refresh), so the CLI's update checks, telemetry and error reports are off.
     claude_env = {
         "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
         "CLAUDE_CODE_SKIP_PROMPT_HISTORY": "1",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "DISABLE_AUTOUPDATER": "1",
+        "DISABLE_TELEMETRY": "1",
+        "DISABLE_ERROR_REPORTING": "1",
     }
-    home = _claude_home()
-    if home.exists():
-        if not _copy_claude_home(container_id):
-            raise ClaudeAuthError(
-                "could not copy the host's ~/.claude into the container "
-                "(set ANTHROPIC_API_KEY to fall back to API billing)\n"
-            )
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        claude_env["CLAUDE_CODE_OAUTH_TOKEN"] = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+    elif _copy_claude_credentials(container_id):
+        pass
     elif os.environ.get("ANTHROPIC_API_KEY"):
         claude_env["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_API_KEY"]
     else:
         raise ClaudeAuthError(
-            "no claude subscription on this host (~/.claude missing) and "
-            "ANTHROPIC_API_KEY not set; cannot authenticate in-container "
-            "claude code"
+            "no claude login for the container: set CLAUDE_CODE_OAUTH_TOKEN (run `claude setup-token` "
+            "once on this host), or log in to claude on this host, or set ANTHROPIC_API_KEY"
         )
 
     # 2. Prompt and config as files - never through a shell at exec time.
@@ -223,10 +211,9 @@ def run_claude_in_container(container_id, repo_to_patch, prompt, model,
     _write_container_file(container_id, f"{WORKDIR}/empty_mcp.json",
                           json.dumps({"mcpServers": {}}))
 
-    # 3. Run as the unprivileged agent user that install() creates.
-    #    bypassPermissions is required for unattended runs; the container
-    #    itself is the sandbox (same posture as the host runner, which runs
-    #    with bypassPermissions on the host workspace).
+    # 3. Run as the unprivileged agent user. bypassPermissions is required for unattended runs;
+    #    the locked container is the sandbox. WebSearch runs on Anthropic's servers, beyond the
+    #    network lock, so it is the --disallowedTools that keeps it out.
     run_cmd = (
         f"cd {shlex.quote(repo_dir)} && claude -p \"$(cat {shlex.quote(WORKDIR + '/.prompt.txt')})\" "
         f"--model {shlex.quote(model)} "
@@ -247,16 +234,14 @@ def run_claude_in_container(container_id, repo_to_patch, prompt, model,
     if log_path:
         Path(log_path).write_text(output, encoding="utf-8")
 
-    # 4. Hard failures first, with the host runner's semantics: auth and
-    #    quota raise; anything else falls through to best-effort patch
-    #    extraction (the CLI sometimes exits non-zero after making edits).
+    # 4. Hard failures first: auth and quota raise; anything else falls through to best-effort
+    #    patch extraction (the CLI sometimes exits non-zero after making edits).
     if code != 0:
         verdict = classify_claude_output(output)
         if verdict == "auth":
             raise ClaudeAuthError(
-                "claude is not authenticated in the container - re-run "
-                "`claude` interactively on the host (or set ANTHROPIC_API_KEY)\n"
-                + output[-800:]
+                "claude is not authenticated in the container - refresh CLAUDE_CODE_OAUTH_TOKEN, "
+                "re-run `claude` on the host, or set ANTHROPIC_API_KEY\n" + output[-800:]
             )
         if verdict == "quota":
             raise ClaudeQuotaExhausted(
@@ -264,18 +249,15 @@ def run_claude_in_container(container_id, repo_to_patch, prompt, model,
             )
 
     _extract_patch(container_id, repo_dir)
-    # The patch lives at /output/fix.patch in the container; run_agent.py
-    # copies it out with the standard docker cp path (host_patch is None).
     return code, None, output, 0
 
 
 # --- opencode-in-container ---------------------------------------------------
 def _opencode_config(model: str, base_url: str) -> str:
-    """Per-run opencode config, same shape as opencode_host_runner._write_config.
+    """Per-run opencode config: one provider (KIConnect through the proxy), no web tools.
 
-    apiKey is resolved from the child's environment (KICONNECT_API_KEY) so
-    the real key never lands in a file; the value only needs to exist and
-    look valid because the proxy rewrites Authorization.
+    apiKey is resolved from the child's environment (KICONNECT_API_KEY), where
+    it is only the proxy placeholder.
     """
     config = {
         "$schema": "https://opencode.ai/config.json",
@@ -311,15 +293,23 @@ def _opencode_config(model: str, base_url: str) -> str:
     return json.dumps(config, indent=2)
 
 
+def _opencode_run_flags(container_id) -> list[str]:
+    """--auto and --standalone when this opencode release knows them (1.x rejects --standalone).
+
+    --standalone gives the run a private server instead of opencode 2's shared background service.
+    """
+    _, help_text, _ = exec_run(container_id, "opencode run --help 2>&1", verbose=False)
+    return [flag for flag in ("--auto", "--standalone") if flag in help_text]
+
+
 def run_opencode_in_container(container_id, repo_to_patch, prompt, model,
                               timeout=3600, wait_cycle=1, log_path=None, base_url=None):
     """Run the opencode CLI inside the task container. base_url overrides the proxy URL (a run-scoped one
     carries the run's id, see key_wait_clock).
 
-    Returns (exit_code, patch_host_path_or_None, log_text, elapsed).
-    Raises OpencodeQuotaExhausted / OpencodeAuthError exactly like
-    opencode_host_runner.run_opencode_on_host, so the orchestrator's
-    existing lane logic handles both identically.
+    Returns (exit_code, None, log_text, 0); the patch is left at /output/fix.patch.
+    Raises OpencodeQuotaExhausted / OpencodeAuthError, which the orchestrator
+    turns into a quota sleep or a stopped lane.
     """
     repo_dir = f"/src/{repo_to_patch}" if repo_to_patch else "/src"
 
@@ -334,21 +324,17 @@ def run_opencode_in_container(container_id, repo_to_patch, prompt, model,
     #    (opencode v2 has no --dir: the process CWD is the project.)
     env = {
         "OPENCODE_CONFIG": f"{WORKDIR}/opencode.json",
-        "KICONNECT_API_KEY": os.getenv("KICONNECT_API_KEY")
-                             or os.getenv("KICONNECT_KEY1") or "proxy-managed",
+        "KICONNECT_API_KEY": PROXY_KEY_PLACEHOLDER,
         "OPENCODE_DISABLE_AUTOUPDATE": "1",
         "OPENCODE_DISABLE_LSP_DOWNLOAD": "1",
         "OPENCODE_DISABLE_MODELS_FETCH": "1",
         "OPENCODE_DISABLE_CLAUDE_CODE": "1",
     }
     _write_env_file(container_id, env)
-    # No --standalone: the 1.x CLI the installer fetches rejects it (prints
-    # usage, exit 1). Without --attach, `opencode run` starts its own server,
-    # and every task has a fresh container, so no state is shared anyway.
     run_cmd = (
         f"cd {shlex.quote(repo_dir)} && opencode run "
         f"--model {shlex.quote('kiconnect/' + model)} "
-        "--auto --format default "
+        f"{' '.join(_opencode_run_flags(container_id))} --format default "
         f"\"$(cat {shlex.quote(WORKDIR + '/.prompt.txt')})\""
     )
     code, stdout, stderr = _run_as_agent(container_id, run_cmd,
@@ -358,7 +344,7 @@ def run_opencode_in_container(container_id, repo_to_patch, prompt, model,
     if log_path:
         Path(log_path).write_text(output, encoding="utf-8")
 
-    # 3. Hard failures first, with the host runner's semantics.
+    # 3. Hard failures first: auth and quota raise.
     if code != 0:
         verdict = classify_opencode_output(output)
         if verdict == "auth":
@@ -368,7 +354,7 @@ def run_opencode_in_container(container_id, repo_to_patch, prompt, model,
                 + output[-800:]
             )
         if verdict == "quota":
-            lock = _pool_lock_seconds(base_url, model)
+            lock = pool_lock_seconds(base_url, model)
             if lock > 0:
                 wake = datetime.now(timezone.utc) + timedelta(seconds=lock + 120)
             else:
@@ -377,6 +363,4 @@ def run_opencode_in_container(container_id, repo_to_patch, prompt, model,
 
     # 4. Best-effort patch extraction (git diff vs baseline commit).
     _extract_patch(container_id, repo_dir)
-    # The patch lives at /output/fix.patch in the container; run_agent.py
-    # copies it out with the standard docker cp path (host_patch is None).
     return code, None, output, 0

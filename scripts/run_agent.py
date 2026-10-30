@@ -38,9 +38,10 @@ import uuid
 import tempfile
 from pathlib import Path
 
-import claude_host_runner
+import cli_failures
+import container_agent_runner
 import key_wait_clock
-import opencode_host_runner
+import sandbox
 
 import tomli
 
@@ -52,6 +53,11 @@ from utils import (
 
 # Default budget per task in seconds (120 minutes), shared by every attempt
 DEFAULT_TIMEOUT = 7200
+# Agent releases the lanes install (the install scripts read them from the environment)
+CLAUDE_CODE_VERSION = "2.1.314"
+OPENCODE_VERSION = "2.2.3"
+# run_agent()'s exit code when the agent's container could not be locked down (see scripts/sandbox.py)
+SANDBOX_EXIT = 127
 
 
 # =============================================================================
@@ -463,25 +469,7 @@ def install(container_id, agent_id, scripts_dir=None, model_id=None):
         scripts_dir: Path to scripts directory (needed for openhands)
         model_id: Model ID (for future use)
     """
-    if agent_id == "claude-code":
-        install_script = """
-set -e
-curl -fsSL https://deb.nodesource.com/setup_20.x 2>/dev/null | bash - >/dev/null 2>&1
-apt-get install -y nodejs sudo >/dev/null 2>&1
-pip3 install tomli boto3 >/dev/null 2>&1
-npm install -g @anthropic-ai/claude-code@2.1.91 >/dev/null 2>&1
-useradd -m -s /bin/bash agent 2>/dev/null || true
-echo 'agent ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
-chown -R agent:agent /src /output /out /work 2>/dev/null || true
-"""
-        code, _, stderr = exec_run(
-            container_id, f"bash -c {shlex.quote(install_script)}",
-            "Installing Claude Code", timeout=600
-        )
-        if code != 0:
-            raise Exception(f"Failed to install Claude Code: {stderr[-500:]}")
-
-    elif agent_id == "openhands":
+    if agent_id == "openhands":
         if not scripts_dir:
             raise ValueError("scripts_dir required for openhands")
         copy_to_container(container_id, scripts_dir / "install_openhands.sh", "/install_openhands.sh")
@@ -514,17 +502,17 @@ chown -R agent:agent /src /output /out /work 2>/dev/null || true
         if code != 0:
             raise Exception(f"Failed to install Gemini CLI: {stderr[-500:]}")
 
-    elif agent_id in ("claude-code-host", "opencode"):
-        # These CLIs run inside THIS container via docker exec
-        # (container_agent_runner), so they must be installed here.
-        script_name = "install_claude_in_container.sh" if agent_id == "claude-code-host" \
-            else "install_opencode_in_container.sh"
+    elif agent_id in ("claude-code", "claude-code-host", "opencode"):
+        # Both claude lanes run the same CLI release, from the same installer.
+        script_name = "install_opencode_in_container.sh" if agent_id == "opencode" \
+            else "install_claude_in_container.sh"
         if not scripts_dir:
             raise ValueError("scripts_dir required for " + agent_id)
         copy_to_container(container_id, scripts_dir / script_name, "/install_agent.sh")
         code, _, stderr = exec_run(
             container_id, "bash -eux /install_agent.sh",
-            f"Installing {agent_id}", timeout=1800
+            f"Installing {agent_id}", timeout=1800,
+            env={"CLAUDE_CODE_VERSION": CLAUDE_CODE_VERSION, "OPENCODE_VERSION": OPENCODE_VERSION},
         )
         if code != 0:
             raise Exception(f"Failed to install {agent_id}: {stderr[-500:]}")
@@ -767,13 +755,49 @@ EOF''',
 def _kiconnect_proxy_url(args):
     """The container-side URL of kiconnect_proxy.py when this lane's model calls go through it, else None."""
     if args.agent == "opencode":
-        import container_agent_runner
         url = container_agent_runner.container_proxy_url()
     elif args.agent == "openhands" and args.model_provider == "kiconnect":
         url = os.getenv("KICONNECT_BASE_URL")
     else:
         return None
     return url if key_wait_clock.is_proxy(url) else None
+
+
+def _model_endpoints(args):
+    """The only URLs this lane's agent may reach once its container is locked: where its model answers."""
+    anthropic = os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+    if args.agent == "claude-code-host":
+        # platform.claude.com refreshes a subscription login's token; it is the API's own address
+        return [anthropic, "https://platform.claude.com"]
+    if args.agent == "opencode":
+        return [container_agent_runner.container_proxy_url()]
+    if args.agent == "gemini-cli":
+        return [os.getenv("GOOGLE_GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com"]
+    if args.model_provider == "bedrock":
+        return [f"https://bedrock-runtime.{args.aws_region}.amazonaws.com"]
+    if args.model_provider == "anthropic":
+        return [anthropic]
+    if args.model_provider == "kiconnect":
+        return [os.getenv("KICONNECT_BASE_URL", "https://chat.kiconnect.nrw/api/v1")]
+    return [os.getenv("OPENAI_BASE_URL") or "https://api.openai.com"]   # litellm and codex: OpenAI-compatible
+
+
+def _restrict_files(container_id, repo_to_patch):
+    """The agent user may write only the repository it patches, /output and the build directories.
+
+    The task's inputs (build scripts, crash log, PoC, config, validate.py) stay root's and read-only, and
+    the container's no-new-privileges keeps sudo and su from lifting that. OpenHands runs as root and is
+    held by the network lock alone: nothing in the container would show it the fix.
+    """
+    user = container_agent_runner.AGENT_USER
+    repo = shlex.quote(f"/src/{repo_to_patch}" if repo_to_patch else "/src")
+    exec_run(
+        container_id,
+        f"id -u {user} >/dev/null 2>&1 || useradd -m -s /bin/bash {user}; mkdir -p /output /work /out; "
+        "chown -R root:root /src /config /scripts /data 2>/dev/null; chmod -R go-w /src /config /scripts /data 2>/dev/null; "
+        f"chown -R {user}:{user} {repo} /output /work /out",
+        "Restricting the agent user to its repository and outputs", workdir="/", check=True,
+    )
 
 
 def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, trajectory_dir):
@@ -793,7 +817,8 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
         trajectory_dir: Directory for trajectory/log files
         
     Returns:
-        tuple: (exit_code, poc_file, patch_file, log_file, container_id, agent_exec_time, key_wait_seconds)
+        tuple: (exit_code, poc_file, patch_file, log_file, container_id, agent_exec_time, key_wait_seconds,
+                network), network being what the locked container could reach (None if no agent ran)
     """
     scripts_dir = Path(__file__).parent.absolute()
     build_image = config.get("build_image", args.default_build_image)
@@ -832,9 +857,10 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
             build_image,
             env_vars=env_vars if env_vars else None,
             container_name=container_name,
-            workdir="/src"
+            workdir="/src",
+            hardened=True,
         )
-        
+
         print(f"  Container: {container_id[:12]}")
 
         # Setup workspace (don't copy ground truth PoC - agent shouldn't see it)
@@ -844,6 +870,15 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
         # this container (via docker exec, see container_agent_runner);
         # every agent installs under its own id.
         install(container_id, args.agent, scripts_dir=scripts_dir)
+
+        # Close the container before the agent starts: from here on it reaches only its model
+        # endpoint, and the agent user writes only what it has to (scripts/sandbox.py).
+        _restrict_files(container_id, config.get("repo_to_patch"))
+        repo_to_patch = config.get("repo_to_patch")
+        network = sandbox.lock_and_verify(container_id, _model_endpoints(args),
+                                          repo=f"/src/{repo_to_patch}" if repo_to_patch else "/src")
+        allowed = ", ".join(f"{a['host']}:{a['port']}" for a in network["allowed"])
+        print(f"  Network locked: only {allowed} is reachable")
 
         # Execute agent
         log_file = trajectory_dir / f"attempt_{attempt}.log"
@@ -873,7 +908,6 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
             # in practice (mongoose/arvo_51757, 2026-10). The container is the
             # sandbox; the agent only ever sees /src, /output and /work.
             if args.agent in ("claude-code-host", "opencode"):
-                import container_agent_runner
                 if args.agent == "claude-code-host":
                     exit_code, _host_patch, _out, _el = container_agent_runner.run_claude_in_container(
                         container_id=container_id,
@@ -932,32 +966,38 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
         poc_file = local_output / "poc.bin"
         patch_file = local_output / "fix.patch"
 
-        return exit_code, poc_file, patch_file, log_file, container_id, agent_exec_time, key_wait
+        return exit_code, poc_file, patch_file, log_file, container_id, agent_exec_time, key_wait, network
 
-    except claude_host_runner.ClaudeQuotaExhausted as e:
+    except cli_failures.ClaudeQuotaExhausted as e:
         # Emit a machine-readable marker so an orchestrator can sleep exactly
         # until the subscription window reopens instead of blind polling.
         print(f"CLAUDE_QUOTA_EXHAUSTED wake_at={e.wake_at.isoformat()}")
         print(f"  Claude quota exhausted; resume at {e.wake_at.isoformat()}")
-        return 125, None, None, None, container_id, 0, 0.0
-    except claude_host_runner.ClaudeAuthError as e:
+        return 125, None, None, None, container_id, 0, 0.0, None
+    except cli_failures.ClaudeAuthError as e:
         print(f"CLAUDE_AUTH_ERROR {e}")
-        return 126, None, None, None, container_id, 0, 0.0
-    except opencode_host_runner.OpencodeQuotaExhausted as e:
+        return 126, None, None, None, container_id, 0, 0.0, None
+    except cli_failures.OpencodeQuotaExhausted as e:
         # Same marker the claude lane uses: the orchestrator's QUOTA_MARKER
         # picks it up and sleeps until the proxy pool frees a key.
         print(f"CLAUDE_QUOTA_EXHAUSTED wake_at={e.wake_at.isoformat()}")
         print(f"  opencode/kiconnect quota exhausted; resume at {e.wake_at.isoformat()}")
-        return 125, None, None, None, container_id, 0, 0.0
-    except opencode_host_runner.OpencodeAuthError as e:
+        return 125, None, None, None, container_id, 0, 0.0, None
+    except cli_failures.OpencodeAuthError as e:
         print(f"OPENCODE_AUTH_ERROR {e}")
-        return 126, None, None, None, container_id, 0, 0.0
+        return 126, None, None, None, container_id, 0, 0.0, None
+    except sandbox.SandboxError as e:
+        # The same failure would hit every task: the orchestrator stops on this marker instead of
+        # recording task after task as failed by the model.
+        print("SANDBOX_ERROR the agent's container could not be locked down; the agent was not started")
+        print(e)
+        return SANDBOX_EXIT, None, None, None, container_id, 0, 0.0, None
     except Exception as e:
         print(f"  Agent execution error: {e}")
         import traceback
         traceback.print_exc()
         # Return container_id so caller can clean it up
-        return 1, None, None, None, container_id, 0, 0.0
+        return 1, None, None, None, container_id, 0, 0.0, None
 
 
 # =============================================================================
@@ -1028,7 +1068,7 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
             work_dir = run_dir / f"workspace_attempt_{attempt}"
             work_dir.mkdir(parents=True, exist_ok=True)
 
-            exit_code, poc_file, patch_file, log_file, agent_container_id, agent_exec_time, key_wait = run_agent(
+            exit_code, poc_file, patch_file, log_file, agent_container_id, agent_exec_time, key_wait, network = run_agent(
                 attempt_args, config, script_path, data_path, prompt, attempt, work_dir, trajectory_dir
             )
             charged += max(0.0, agent_exec_time - key_wait)
@@ -1037,6 +1077,12 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
             print(f"  Agent: {agent_time:.1f}s ({agent_time/60:.1f}m), exec: {agent_exec_time:.1f}s ({agent_exec_time/60:.1f}m), "
                   f"key waits: {key_wait:.0f}s, exit={exit_code}")
 
+            if exit_code == SANDBOX_EXIT:
+                # No agent ran: not an attempt of the model, and the task is to be run again.
+                all_attempts.append({"attempt": attempt, "agent_exec_seconds": 0, "stage3": "sandbox_error",
+                                     "success": False, "budget_charged_seconds": round(charged, 1)})
+                return "sandbox_error", all_attempts
+
             # Check for generated files (poc/patch are None on early quota exits)
             if args.mode == "e2e" and not (poc_file and poc_file.exists()):
                 print("  No PoC generated!")
@@ -1044,6 +1090,7 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
                     "attempt": attempt,
                     "agent_exec_seconds": round(agent_exec_time, 2),
                     "key_wait_seconds": round(key_wait, 1),
+                    "network": network,
                     "stage1": "no_poc",
                     "stage2": "skipped",
                     "stage3": "skipped",
@@ -1061,6 +1108,7 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
                     "attempt": attempt,
                     "agent_exec_seconds": round(agent_exec_time, 2),
                     "key_wait_seconds": round(key_wait, 1),
+                    "network": network,
                     "stage1": "skipped",
                     "stage2": "skipped",
                     "stage3": "no_patch",
@@ -1122,6 +1170,7 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
                 "key_wait_seconds": round(key_wait, 1),
                 "validation_seconds": round(validation_time, 1),
                 "budget_charged_seconds": round(charged, 1),
+                "network": network,
                 "stage1": results.get("stage1") if args.mode == "e2e" else None,
                 "stage2": results.get("stage2") if args.mode == "e2e" else None,
                 "stage3": results.get("stage3"),

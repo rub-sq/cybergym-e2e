@@ -71,6 +71,8 @@ def classify(s):
         return "instant_death(<60s)"
     if str(s.get("status", "")).lower() == "error":
         return "status_error"
+    if s.get("status") == "sandbox_error":
+        return "sandbox_error"   # the container could not be locked down; no agent ran
     if all(a.get("agent_exec_seconds", 0) == 0 for a in atts):
         return "agent_never_ran"
     if all(0 <= a.get("agent_exec_seconds", 0) < MIN_AGENT_SECONDS for a in atts):

@@ -87,7 +87,7 @@ def copy_to_container(container_id, src_path, dst_path, file_list=None):
             raise Exception(f"Failed to copy {src_path}: {result.stderr}")
 
 
-def start_container(image, env_vars=None, container_name=None, workdir=None):
+def start_container(image, env_vars=None, container_name=None, workdir=None, hardened=False):
     """Start a Docker container and return its ID.
 
     Args:
@@ -95,6 +95,8 @@ def start_container(image, env_vars=None, container_name=None, workdir=None):
         env_vars: Dict of environment variables to set in container (optional)
         container_name: Name for the container (optional)
         workdir: Working directory in container (optional)
+        hardened: an agent's container: no process in it can gain privileges (sudo and su
+            stay unprivileged for the agent user) and none can open raw sockets
 
     Returns:
         Container ID
@@ -102,6 +104,8 @@ def start_container(image, env_vars=None, container_name=None, workdir=None):
     # host.docker.internal lets the agent reach a proxy running on the host
     # (used for KIConnect key rotation); harmless when nothing listens there.
     cmd = ["docker", "run", "-d", "--rm", "--add-host=host.docker.internal:host-gateway"]
+    if hardened:
+        cmd += ["--security-opt", "no-new-privileges:true", "--cap-drop", "NET_RAW"]
 
     if container_name:
         cmd.extend(["--name", container_name])
@@ -404,6 +408,9 @@ def get_llm_env(
         "AGENT_ENABLE_PROMPT_EXTENSIONS": "false",
         "AGENT_ENABLE_BROWSING": "false",
         "ENABLE_BROWSER": "false",
+        # litellm otherwise fetches its model price list from GitHub at import, which the
+        # locked container (scripts/sandbox.py) cannot reach
+        "LITELLM_LOCAL_MODEL_COST_MAP": "True",
         # Retry settings for rate limiting
         "LLM_NUM_RETRIES": "10",
         "LLM_RETRY_MIN_WAIT": "15",
@@ -458,11 +465,13 @@ def get_llm_env(
         # only carries a placeholder - the proxy rewrites Authorization itself.
         kiconnect_base_url = os.getenv("KICONNECT_BASE_URL", "https://chat.kiconnect.nrw/api/v1")
         proxied = kiconnect_base_url != "https://chat.kiconnect.nrw/api/v1"
-        kiconnect_api_key = os.getenv("KICONNECT_API_KEY", "")
-        if not kiconnect_api_key:
-            if not proxied:
+        if proxied:
+            # no real key enters the container: the proxy sets Authorization itself
+            kiconnect_api_key = "proxy-managed:not-a-real-key"
+        else:
+            kiconnect_api_key = os.getenv("KICONNECT_API_KEY", "")
+            if not kiconnect_api_key:
                 raise RuntimeError("KICONNECT_API_KEY env var not set; required for kiconnect mode")
-            kiconnect_api_key = "proxy-managed"
 
         # LiteLLM requires the openai/ prefix to route this as a generic
         # OpenAI-compatible provider instead of trying to guess from the bare model name.

@@ -188,6 +188,8 @@ def already_done(task, output_dir):
         return False
     if str(data.get("status", "")).upper() == "SUCCESS":
         return True
+    if data.get("status") == "sandbox_error":
+        return False   # no agent was started
     if safeguard_flagged(task, output_dir):
         return False   # never reached the model; retry it
     return data.get("duration_seconds", 0) >= 60
@@ -315,6 +317,14 @@ class Lane(threading.Thread):
                     fh.write(f"\n===== {task} =====\n{output}\n")
             except OSError as exc:
                 log(self.lane, f"could not write task log ({exc}); continuing")
+
+        if "SANDBOX_ERROR" in output:
+            # The agent's container could not be locked down. Running on would hand the
+            # next tasks to agents with an open network, or fail every one the same way.
+            log(self.lane, "an agent's container could not be locked down - stopping all lanes "
+                           "(see the task log; check with: python3 scripts/sandbox.py --check)")
+            STOP.set()
+            return None
 
         if self.handles_claude_quota:
             match = QUOTA_MARKER.search(output)
@@ -500,8 +510,7 @@ def main():
                 name, tasks, out,
                 openhands_cmd_factory(model, out, args.max_attempts, args.timeout),
                 gate,
-                env={"KICONNECT_BASE_URL": args.proxy_url,
-                     "KICONNECT_API_KEY": os.getenv("KICONNECT_KEY1", "proxy-managed")},
+                env={"KICONNECT_BASE_URL": args.proxy_url},
                 log_path=str(log_dir / f"{name.replace(':', '_')}.log"),
             ))
     if args.claude:
@@ -530,8 +539,7 @@ def main():
                 name, tasks, out,
                 opencode_cmd_factory(model, out, args.max_attempts, args.timeout),
                 gate,
-                env={"KICONNECT_BASE_URL": args.proxy_url,
-                     "KICONNECT_API_KEY": os.getenv("KICONNECT_KEY1", "proxy-managed")},
+                env={"KICONNECT_BASE_URL": args.proxy_url},
                 log_path=str(log_dir / f"{name.replace(':', '_')}.log"),
                 handles_claude_quota=True,
             ))

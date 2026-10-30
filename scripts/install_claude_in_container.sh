@@ -1,27 +1,24 @@
 #!/bin/bash
-# Install Claude Code inside a task container so the claude lane can run
-# in-container (see container_agent_runner.py) instead of on the host.
+# Install Claude Code inside a task container (see container_agent_runner.py).
 #
-# Authentication is handled by the runner, not here: the host's subscription
-# login (~/.claude) is streamed into the container per-run, or
-# ANTHROPIC_API_KEY is injected when no subscription is logged in.
+# The release is CLAUDE_CODE_VERSION, set by run_agent.py. The official native installer brings a
+# single binary, so task images of any age work without a recent Node.js (the npm package of
+# current releases demands Node 22). It installs into root's home; the binary is copied onto the
+# system PATH for the unprivileged agent user. Authentication is the runner's job, and run_agent.py
+# closes the container's network before the CLI starts (scripts/sandbox.py).
 
 set -eux
 
 apt-get update
 apt-get install -y curl ca-certificates
 
-curl -fsSL https://deb.nodesource.com/setup_20.x 2>/dev/null | bash - >/dev/null 2>&1 || true
-apt-get install -y nodejs sudo >/dev/null 2>&1
+# Retried: one dropped connection would otherwise cost the whole attempt. A bash loop instead of
+# curl's --retry-all-errors, which older task images (curl < 7.71) do not know.
+for i in 1 2 3 4 5; do
+    ( set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_CODE_VERSION:?}" ) && break
+    echo "claude installer failed (try $i/5); retrying in 10s" >&2
+    sleep 10
+done
 
-npm install -g @anthropic-ai/claude-code@2.1.91
-
-# The runner invokes the CLI as the unprivileged `agent` user (created by
-# run_agent.install); make sure it exists so a fresh container without the
-# claude-code host-lane user can still run the in-container agent.
-useradd -m -s /bin/bash agent 2>/dev/null || true
-mkdir -p /work /output
-chown -R agent:agent /src /output /work 2>/dev/null || true
-
-command -v claude
-claude --version 2>&1 | head -1 || true
+install -m 755 "$(readlink -f "$HOME/.local/bin/claude")" /usr/local/bin/claude
+claude --version

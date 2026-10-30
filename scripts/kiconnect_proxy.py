@@ -17,6 +17,12 @@ A request whose path starts with /run/<run id> belongs to that run: the time it 
 for a key (a pool where every key is busy or locked, or a concurrency back-off) is added to the
 run's total, which GET /_waits/<run id> returns. Waiting for a key is not time an agent spends
 working, so the harness keeps it off the agent's clock (key_wait_clock.py).
+
+The proxy is the only destination an agent's locked container can reach (sandbox.py), so it
+forwards model calls and nothing else. A gateway can offer more than the model API (endpoints that
+fetch a URL, request fields that make the gateway or the model search the web or call tools
+server-side), and either would let an agent fetch the upstream fix through this one open route.
+Refused paths and stripped fields are logged.
 """
 
 import argparse
@@ -58,6 +64,14 @@ AUTH_PATTERNS = (
 )
 
 RUN_PATH_RE = re.compile(r"^/run/([A-Za-z0-9_.-]{1,128})(/.*)?$")
+
+# The model API, by method; any other path is refused, not forwarded.
+FORWARDED = {"POST": ("/chat/completions", "/completions", "/responses"), "GET": ("/models",)}
+# Request fields that make the gateway or the provider act on their own (web search, retrieval, files,
+# server-side tool servers); and the only tool types an agent may declare, both executed by the agent.
+SERVER_SIDE_FIELDS = ("features", "tool_ids", "tool_servers", "files", "filter_ids", "web_search_options",
+                      "plugins")
+CLIENT_TOOL_TYPES = ("function", "custom")
 
 QUOTA_RE = re.compile("|".join(QUOTA_PATTERNS), re.IGNORECASE)
 CONCURRENCY_RE = re.compile("|".join(CONCURRENCY_PATTERNS), re.IGNORECASE)
@@ -397,6 +411,15 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        if path.rstrip("/") in ("", "/v1"):
+            # the base URL itself: what sandbox.verify asks to see the proxy is reachable
+            payload = b'{"proxy": "kiconnect"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         self._proxy(b"")
 
     def do_POST(self):
@@ -406,6 +429,10 @@ class Handler(BaseHTTPRequestHandler):
     def _proxy(self, body):
         run, path = split_run(self.path)
         suffix = path.replace("/v1", "", 1)
+        if suffix.split("?", 1)[0].rstrip("/") not in FORWARDED.get(self.command, ()):
+            log(f"refused {self.command} {self.path}: not a model API call")
+            self._fail(403, "this proxy forwards model API calls only")
+            return
         body, translate_back, requested_model = self._adapt_body(body)
         if translate_back:
             # chat-completions in, /responses out; the reply is converted back
@@ -471,13 +498,23 @@ class Handler(BaseHTTPRequestHandler):
         model = payload.get("model", "")
         is_chat = "chat/completions" in self.path
 
+        stripped = [field for field in SERVER_SIDE_FIELDS if payload.pop(field, None) is not None]
+        tools = payload.get("tools")
+        if isinstance(tools, list):
+            kept = [t for t in tools if isinstance(t, dict) and t.get("type", "function") in CLIENT_TOOL_TYPES]
+            if len(kept) != len(tools):
+                stripped.append(f"{len(tools) - len(kept)} server-side tool(s)")
+                payload["tools"] = kept
+        if stripped:
+            log(f"stripped from a request for {model}: {', '.join(stripped)}")
+
         # Some OpenAI-compatible gateways (vllm behind a strict OpenAI-style
         # validator) reject non-string message content ("$.messages[N].content:
         # Invalid format for input"): tool-call history arrives with content
         # null or as a multimodal array, even empty ("[]"). Normalise to plain
         # strings before forwarding; array content that actually carries image
         # parts is left untouched so vision models keep working.
-        mutated = False
+        mutated = bool(stripped)
         for message in payload.get("messages") or []:
             if not isinstance(message, dict):
                 continue
