@@ -1,0 +1,84 @@
+# Changes in this fork
+
+This repository is our fork of CyberGym-E2E. We forked the upstream repository at commit `b861317` ("add docker image pre-download script", June 24, 2026) to run its coding agents as baselines for our own study, with models served by KIConnect and with Claude Code on a subscription. Since then we changed how the agents reach their models, where they run, how much time a task gets, and what an agent can see and reach while it works. This file describes every change, grouped by purpose. The git history has the same changes commit by commit.
+
+The benchmark itself is untouched. `projects/` holds the same tasks, and `scripts/validate.py` builds and tests a patch the way upstream does, apart from one retry described below.
+
+## Models through KIConnect
+
+Upstream reaches models through Bedrock, the Anthropic API or a LiteLLM server. We added a fourth provider, `--model-provider kiconnect`, for the models served by KIConnect. OpenHands talks to it through LiteLLM, which needs the `openai/` prefix to treat KIConnect as a generic OpenAI-compatible endpoint (`get_llm_env` in `scripts/utils.py`). For Qwen models we force native tool calling. OpenHands enables it only for models on its own list, and without it a Qwen model answered in prose, produced no actions and got stuck in a loop.
+
+## The key-rotating proxy
+
+A KIConnect key allows three concurrent requests and a limited number of messages per window, so a long run needs several keys. `scripts/kiconnect_proxy.py` is a small OpenAI-compatible proxy on the host that holds the keys and gives every agent one stable address. It tells the two kinds of HTTP 429 apart. A concurrency limit is retried after a short pause, and a spent quota locks that key for that model while the request moves on to the next key. A key that KIConnect rejects with HTTP 401 is rotated out as well. The lock state survives a restart (`--state-file`).
+
+Some fixes came from what the gateway accepts. GPT-5 models want `max_completion_tokens` instead of `max_tokens`, and the Codex models answer only on `/responses`, so the proxy translates a chat request into a `/responses` call and the reply back, with the output budget raised to that endpoint's minimum. The gateway rejects message content that is `null` or a list, which tool-call histories contain, so the proxy turns such content into plain strings. Lists that carry images are left alone. `KICONNECT_PROXY_DEBUG=1` saves every request and response body for diagnosis.
+
+A request whose path starts with `/run/<id>` belongs to that run, and the proxy adds up how long the run waited for a key. `GET /_waits/<id>` returns the total, which the time budget uses (see below). The proxy is also the only destination a locked KIConnect lane can reach, so it now forwards model calls and nothing else (see the sandbox section).
+
+## Several agents side by side
+
+`run_dual_agents.sh` starts the proxy and `scripts/dual_agent_orchestrator.py`, which runs one lane per agent and model. OpenHands, Claude Code and opencode can run at the same time, each with several models. Each lane runs one task at a time and waits on its own, so a lane that waits for KIConnect quota does not hold up Claude, and Claude waiting out its five-hour or weekly limit does not hold up the others.
+
+Most of the orchestrator grew out of problems in long runs. It keeps a floor of free disk space and cleans up before a task when the floor is reached. A failed log write no longer stops a lane, since a full disk once took the OpenHands lane down for 35 hours without a trace. Leftover containers of earlier tasks are removed by name, not only by image. When Claude runs out of quota, the lane sleeps until the time Claude names, with growing waits if it names none, and a task that stays blocked is not retried forever. A run stopped by Claude's real-time cyber safeguards is retried instead of counted as a failure, because identical input passed about half of the time. On resume, a task counts as done after a success or after a failed run of at least 60 seconds.
+
+On the tower, containers cannot reach the host through `host-gateway`, so `OPENHANDS_PROXY_URL` names the address they can use, the host's LAN address, and every KIConnect lane uses it. `KICONNECT_KEY2_ONLY=1` pools only the second key, because a model id such as Mistral's exists only on the account it belongs to. The proxy health check runs in Python instead of curl, which some servers lack, and it bypasses any system HTTP proxy on the loopback hop.
+
+## Where the agents run
+
+At first, Claude Code and opencode ran on the host. The source tree was exported from the task container, the CLI edited it in a host directory, and the diff went back into the pipeline (`claude_host_runner.py`, `opencode_host_runner.py`). Claude Code ran there because a subscription login lives in the user's home directory. Then opencode, working on mongoose (`arvo_51757`), walked up from its workspace into this repository and read `projects/<task>/patch.diff`, the maintainers' fix. We first moved the host workspaces out of the repository and then moved both CLIs into the task container (`scripts/container_agent_runner.py`). They run there through `docker exec`, as an unprivileged `agent` user, like OpenHands, and see only the container. The host runners stayed in the repository afterwards, unused apart from a few helper functions. We moved those helpers into `scripts/cli_failures.py` and removed the runners.
+
+Inside the container, the patch is the `git diff` against a baseline commit. `setup_workspace` creates that commit in every source directory after extracting the source, and it removes any `.git` the tarball shipped. So `git diff` works for every task, and no history of the project, which could contain the fix, is left in the container. Patch extraction runs as root over a tree the agent owns, which git refuses without `safe.directory`, so we set it.
+
+The lane is still called `claude-code-host`, and its model flag `--claude-host-model`, although it no longer runs on the host. Renaming them would break the output directory `agent_output_claude_host` and the resume logic of runs in progress.
+
+## Keeping agents from finding the fix
+
+This is the newest change, ported from the network isolation of our SecRepoBench harness. In another benchmark, Claude Code and opencode went looking for the maintainers' fix, on the machine and on GitHub, although they ran inside a container. Turning off an agent's web tools does not help, because a shell command such as `curl` or `git clone` reaches the same places. So we now close the container itself, once the agent is installed and before it starts (`scripts/sandbox.py`, called from `run_agent.py` for every lane).
+
+After that, the container can open TCP connections only to the lane's model endpoint. That is the KIConnect proxy for OpenHands and opencode, and the Anthropic API for Claude Code, together with `platform.claude.com`, which refreshes a subscription login and has the same address. Everything else is rejected, IPv6 included. The allowed hosts are written into `/etc/hosts` and `resolv.conf` is emptied, so no other name resolves. The firewall rules are written by a short-lived helper container (`cybergym-netlock:1`, Alpine with iptables, built on first use). It joins only the network namespace of the task container and holds NET_ADMIN for those few seconds. The task container never has that capability, so nothing in it can change the rules, root included. This is where we departed from the SecRepoBench harness, whose entry point dropped the agent's privileges inside the container. OpenHands runs as root, and dropping privileges inside the container would not have stopped it.
+
+After the lock, `sandbox.verify` tries, as root and as the agent user, what an agent must not be able to do. It contacts GitHub, raw.githubusercontent.com, GitLab, PyPI, npm and bare IP addresses, connects to GitHub by address on ports 443, 22 and 9418, sends a request over IPv6 and, where the image has Python, a DNS query over UDP. Every attempt must fail and the model endpoint must answer. If the lock does not hold, the agent does not start. The task then ends as `sandbox_error`, which never counts as done, and the orchestrator stops every lane, because the same failure would hit every task. `run_dual_agents.sh` runs the same check on a scratch container before the first task (`python3 scripts/sandbox.py --check`) and does not start if it fails. Every attempt in `summary.json` records what its container could reach.
+
+We also narrowed what the agent can do inside the container. The container runs with `no-new-privileges` and without raw sockets, so sudo and su cannot make the agent user root. The agent user owns only the repository it patches and the output and build directories. The build scripts, the crash log, the PoC, the configuration and `validate.py` belong to root and are read-only for it. The Claude lane used to copy almost all of the host's `~/.claude` into the container, including the prompt history of every project on the machine. It now takes a long-lived token from `CLAUDE_CODE_OAUTH_TOKEN`, made once with `claude setup-token`, or the host's own login and nothing else, or falls back to `ANTHROPIC_API_KEY`. The host's login is `~/.claude/.credentials.json` on Linux and an item in the login Keychain on macOS. It reaches the container through standard input, so it is never written to a file on the host. Containers no longer hold a real KIConnect key either. The proxy sets the key itself, and a client gets a placeholder that only has the shape of a key, which opencode 2 insists on.
+
+The proxy needed hardening too, because it is the one route out of a KIConnect lane and it used to forward any path to the gateway. Gateways of this kind can offer more than model calls, such as endpoints that fetch a URL, or request fields that turn on web search or attach files. The proxy now forwards only `/chat/completions`, `/completions`, `/responses` and `GET /models`, removes such fields and every tool type other than functions, and logs what it refused or removed.
+
+OpenHands had the same weakness as the other two agents. Its browser was already turned off by configuration, but its shell had the full network. It is now locked like the others. We also set `LITELLM_LOCAL_MODEL_COST_MAP`, because LiteLLM otherwise downloads its price list from GitHub when it starts.
+
+The lock has two limits. A tool that runs on the provider's side is beyond its reach. Claude Code's WebSearch is executed by Anthropic, so the `--disallowedTools` flag is what keeps it out. And a build that downloads dependencies fails inside a locked container. The orchestrator's lanes use the `no-test` prompt, so the agent does not build, and the final validation runs in fresh containers with network access, as before.
+
+## Agent versions and installers
+
+Claude Code is now 2.1.314 and opencode 2.2.3, the latest versions on October 30, 2026, pinned in `run_agent.py` (`CLAUDE_CODE_VERSION`, `OPENCODE_VERSION`). Before, the in-container lane installed opencode with the old installer (`opencode.ai/install`), which brings only opencode 1.x. The in-container opencode lane has therefore run version 1.x since it was introduced on October 15, whereas the host lane before it ran version 2. The new installer (`opencode.ai/v2/install`) brings version 2. The runner reads `opencode run --help` and passes `--auto` and `--standalone` when the installed version knows them, since 1.x rejects `--standalone`. With `--standalone`, each run gets a private server instead of opencode 2's shared background service. The installer also adds ripgrep, because opencode's grep and glob tools would otherwise download it on first use, which the lock forbids.
+
+Claude Code is installed with Anthropic's native installer, which brings a single binary. Its current npm package requires Node 22, which older task images cannot install. Both Claude lanes, ours and upstream's `claude-code` lane, now use the same installer. Upstream's lane also gave the agent user sudo without a password. We removed that rule, because the agent should not become root and `no-new-privileges` would block it anyway.
+
+OpenHands stays at 1.0.0, the version upstream used. Its installer retries the network steps, since a single dropped connection to astral.sh used to cost a whole attempt, and it patches the `binaryornot` package, whose Python 2 code breaks on Python 3.13. `install_validate_deps.sh` no longer installs uv and a standalone Python in every container. Those downloads failed more than a thousand times in the August run and broke about 385 tasks at validation. `validate.py` needs only tomli, which the container's own Python provides, or which it installs as a small wheel.
+
+## Workspace, prompt and validation fixes
+
+- `start_container` maps `host.docker.internal` to the host, so containers can reach the proxy.
+- The `no-test` prompt of patch-only mode asks the agent to edit the files and write the patch with `git diff`, instead of writing the diff by hand. Hand-written diffs came with invented hashes and drifting line numbers that `git apply` rejected. The prompt also says "do not compile the code or run the test suite" instead of "do not compile or run any tests", because the agent has to run `git diff`.
+- `validate.py` retries restoring the source tree up to three times. `rm -rf` on the `.git` of a large repository sometimes failed with "Directory not empty" and sank the whole validation.
+- `run_agent.py` handles an attempt that ends without a patch file, which used to raise an error, and it records the model that actually ran in the Claude lane instead of a default name.
+- A previous attempt's container is removed at the start of the next attempt, so failed tasks no longer leave containers behind.
+
+## Time budget
+
+Upstream gives each attempt the full `--timeout` and runs one attempt by default. The paper allows 90 minutes and $10 per run. We give a task 120 minutes in total, shared by at most two attempts (`--timeout 7200`, the default in `run_agent.py`, `batch_run.sh` and the orchestrator). The budget counts each attempt's agent run and its validation builds. Starting the container, preparing the workspace and installing the agent do not count, and neither does the time a request waits for a free KIConnect key. The proxy measures that wait per run, and `scripts/key_wait_clock.py` gives it back to the agent before ending the run the way the agent's own `timeout` would. A second attempt runs only if at least ten minutes are left, and it receives feedback on why the first attempt failed. `summary.json` records the key waits, the validation time and the budget used by each attempt. The $10 cap has no meter on KIConnect, where quota locks play its part. This is the rule of our own system as well, so both measure how long an agent takes to resolve a security issue, builds included.
+
+## Analysis and preparation scripts
+
+`classify.py` separates genuine failures from failures of the environment, such as runs that never reached the model, runs stopped by Claude's safeguards and `sandbox_error` runs, and it can write the latter to a rerun list. `compare_subset.py` scores every model on the same set of tasks, the ones a reference model got to attempt, because tasks blocked for one model are not a random sample. `scripts/prep_tasks.sh` downloads the data and pulls the build images for a task file (`tasks_20.txt` by default) and skips what is already present. `AGENTS.md` holds our notes for running the benchmark on the tower.
+
+## What we removed
+
+These files had no use in the pipeline anymore. All of them remain in the git history.
+
+- `scripts/claude_host_runner.py` and `scripts/opencode_host_runner.py`, the host runners, replaced by the in-container runner. Their helpers moved to `scripts/cli_failures.py`.
+- `scripts/probe_opencode.sh`, a smoke test of the host lane and of the opencode 1.x invocation. `sandbox.py --check` and one real task per lane replace it.
+- `opencode.json`, the provider configuration of the host lane.
+- `scripts/kiconnect_provider.py`, an early concurrency wrapper for LiteLLM that nothing imported once the proxy existed.
+- `run_920_tasks.sh`, the first batch script, with one key per model, replaced by `run_dual_agents.sh` and the orchestrator.
+- `diagnose_refusals.sh`, a one-off script from September that replayed prompts to find out whether Claude's safeguards reacted to the content or to the account.
