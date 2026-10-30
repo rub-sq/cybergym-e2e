@@ -91,6 +91,10 @@ if [ "$(id -u)" != 0 ]; then
     if [ -w "$REPO" ]; then ok "agent can write its repository $REPO"; else bad "agent cannot write its repository $REPO"; fi
   fi
 fi
+if [ -n "$REPO" ] && command -v git >/dev/null 2>&1; then
+  if git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then ok "git works in $REPO as $(id -un)"
+  else bad "git refuses $REPO as $(id -un): the agent could not produce its patch with git diff"; fi
+fi
 command -v curl >/dev/null 2>&1 || { echo "FAIL: curl is missing, nothing could be checked"; exit 1; }
 
 if getent hosts github.com >/dev/null 2>&1; then bad "github.com resolves"; else ok "no DNS: github.com does not resolve"; fi

@@ -787,7 +787,9 @@ def _restrict_files(container_id, repo_to_patch):
 
     The task's inputs (build scripts, crash log, PoC, config, validate.py) stay root's and read-only, and
     the container's no-new-privileges keeps sudo and su from lifting that. OpenHands runs as root and is
-    held by the network lock alone: nothing in the container would show it the fix.
+    held by the network lock alone: nothing in the container would show it the fix. git refuses a
+    repository another user owns, so it is told to trust the repository for every user: otherwise root
+    (OpenHands, and our own patch extraction) gets an empty `git diff`.
     """
     user = container_agent_runner.AGENT_USER
     repo = shlex.quote(f"/src/{repo_to_patch}" if repo_to_patch else "/src")
@@ -795,7 +797,7 @@ def _restrict_files(container_id, repo_to_patch):
         container_id,
         f"id -u {user} >/dev/null 2>&1 || useradd -m -s /bin/bash {user}; mkdir -p /output /work /out; "
         "chown -R root:root /src /config /scripts /data 2>/dev/null; chmod -R go-w /src /config /scripts /data 2>/dev/null; "
-        f"chown -R {user}:{user} {repo} /output /work /out",
+        f"chown -R {user}:{user} {repo} /output /work /out && git config --system --add safe.directory '*'",
         "Restricting the agent user to its repository and outputs", workdir="/", check=True,
     )
 
