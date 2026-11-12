@@ -54,7 +54,16 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-[[ -f .env ]] && { set -a; source .env; set +a; }
+# .env supplies defaults: a variable the caller already set keeps its value.
+if [[ -f .env ]]; then
+    while IFS= read -r _line || [[ -n "$_line" ]]; do
+        [[ "$_line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)= ]] || continue
+        _name="${BASH_REMATCH[2]}"
+        [[ -n "${!_name+x}" ]] && continue
+        eval "$_line"
+        export "$_name"
+    done < .env
+fi
 [[ -f .venv_runner/bin/activate ]] && source .venv_runner/bin/activate
 
 # A system-wide http_proxy must never intercept the loopback proxy hop;
