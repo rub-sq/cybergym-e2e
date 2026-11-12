@@ -465,6 +465,9 @@ def main():
                     help="kiconnect model id for opencode; repeat for one lane per model")
     ap.add_argument("--opencode-output", default=None,
                     help="output dir; only valid with a single --opencode-model")
+    ap.add_argument("--opencode-proxy-url", default=None,
+                    help="container-side URL of opencode's own proxy, when it serves another provider "
+                         "than OpenHands' (default: --proxy-url)")
     args = ap.parse_args()
 
     if not (args.openhands or args.claude or args.opencode):
@@ -529,7 +532,11 @@ def main():
             ap.error("--opencode-output cannot be used with several models")
         # opencode runs INSIDE the task container, so it reaches the proxy via
         # the same container-side URL as openhands (--proxy-url / the
-        # OPENHANDS_PROXY_URL override on hosts where host-gateway is refused).
+        # OPENHANDS_PROXY_URL override on hosts where host-gateway is refused),
+        # or via its own proxy's URL (--opencode-proxy-url).
+        proxy_env = {"KICONNECT_BASE_URL": args.opencode_proxy_url or args.proxy_url}
+        if args.opencode_proxy_url:
+            proxy_env["OPENCODE_PROXY_URL"] = args.opencode_proxy_url
         for model in models:
             tag = re.sub(r"[^A-Za-z0-9]+", "_", model).strip("_")[:40]
             out = args.opencode_output or f"agent_output_opencode_{tag}"
@@ -539,7 +546,7 @@ def main():
                 name, tasks, out,
                 opencode_cmd_factory(model, out, args.max_attempts, args.timeout),
                 gate,
-                env={"KICONNECT_BASE_URL": args.proxy_url},
+                env=dict(proxy_env),
                 log_path=str(log_dir / f"{name.replace(':', '_')}.log"),
                 handles_claude_quota=True,
             ))

@@ -55,9 +55,11 @@ def container_proxy_url() -> str:
     KICONNECT_BASE_URL is set per-lane by the orchestrator to the
     container-side URL (host.docker.internal, or the OPENHANDS_PROXY_URL
     override where host-gateway is refused); OPENHANDS_PROXY_URL wins when
-    the operator passed it explicitly.
+    the operator passed it explicitly. OPENCODE_PROXY_URL, which the
+    orchestrator sets when opencode has a proxy of its own (another
+    provider than OpenHands'), wins over both.
     """
-    url = os.getenv("OPENHANDS_PROXY_URL") or os.getenv("KICONNECT_BASE_URL")
+    url = os.getenv("OPENCODE_PROXY_URL") or os.getenv("OPENHANDS_PROXY_URL") or os.getenv("KICONNECT_BASE_URL")
     return url or "http://host.docker.internal:8817/v1"
 
 
@@ -257,8 +259,16 @@ def _opencode_config(model: str, base_url: str) -> str:
     """Per-run opencode config: one provider (KIConnect through the proxy), no web tools.
 
     apiKey is resolved from the child's environment (KICONNECT_API_KEY), where
-    it is only the proxy placeholder.
+    it is only the proxy placeholder. OPENCODE_CONTEXT_LIMIT / OPENCODE_OUTPUT_LIMIT
+    set the model's limits (opencode compacts the session before the context
+    fills, so they must not exceed what the serving endpoint accepts), and
+    OPENCODE_CHUNK_TIMEOUT_MS how long opencode waits for the proxy, which
+    answers only once the whole reply is in and, on OpenRouter, waits out
+    rate limits first.
     """
+    context_limit = int(os.getenv("OPENCODE_CONTEXT_LIMIT") or 262144)
+    output_limit = int(os.getenv("OPENCODE_OUTPUT_LIMIT") or 131072)
+    chunk_timeout_ms = int(os.getenv("OPENCODE_CHUNK_TIMEOUT_MS") or 600000)
     config = {
         "$schema": "https://opencode.ai/config.json",
         "model": f"kiconnect/{model}",
@@ -275,16 +285,16 @@ def _opencode_config(model: str, base_url: str) -> str:
                 "options": {
                     "baseURL": base_url,
                     "apiKey": "{env:KICONNECT_API_KEY}",
-                    # Slow 27B inference behind a queue: no request deadline,
-                    # but a dead connection (no chunk for 10 min) still aborts.
+                    # Slow inference behind a queue: no request deadline,
+                    # but a dead connection (no chunk for the timeout) still aborts.
                     "timeout": False,
                     "headerTimeout": False,
-                    "chunkTimeout": 600000,
+                    "chunkTimeout": chunk_timeout_ms,
                 },
                 "models": {
                     model: {
                         "name": model,
-                        "limit": {"context": 262144, "output": 131072},
+                        "limit": {"context": context_limit, "output": output_limit},
                     }
                 },
             }

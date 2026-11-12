@@ -18,11 +18,17 @@ for a key (a pool where every key is busy or locked, or a concurrency back-off) 
 run's total, which GET /_waits/<run id> returns. Waiting for a key is not time an agent spends
 working, so the harness keeps it off the agent's clock (key_wait_clock.py).
 
+With --provider openrouter the same proxy fronts OpenRouter with one key: --provider-order pins the
+endpoints allowed to serve every request, a rate limit or an endpoint outage is waited out (off the
+agent's clock) instead of locking the key, and only a 402 (no credits) locks it.
+
 The proxy is the only destination an agent's locked container can reach (sandbox.py), so it
 forwards model calls and nothing else. A gateway can offer more than the model API (endpoints that
 fetch a URL, request fields that make the gateway or the model search the web or call tools
 server-side), and either would let an agent fetch the upstream fix through this one open route.
-Refused paths and stripped fields are logged.
+Refused paths and stripped fields are logged. An agent can also send requests of its own, so
+--allow-model refuses any model but the lane's (on OpenRouter a model id can itself switch web
+search on, and a `models` list reroutes the request).
 """
 
 import argparse
@@ -76,6 +82,15 @@ CLIENT_TOOL_TYPES = ("function", "custom")
 QUOTA_RE = re.compile("|".join(QUOTA_PATTERNS), re.IGNORECASE)
 CONCURRENCY_RE = re.compile("|".join(CONCURRENCY_PATTERNS), re.IGNORECASE)
 AUTH_RE = re.compile("|".join(AUTH_PATTERNS), re.IGNORECASE)
+
+# --provider openrouter. One key, billed per token: a 429 is a short rate limit (wait and retry, never a
+# lock), 402 means no credits left. While every endpoint a request allows is down, OpenRouter answers 404
+# "No allowed providers are available", which is an outage to wait out like a 5xx.
+OPENROUTER_UPSTREAM = "https://openrouter.ai/api/v1"
+NO_PROVIDER_RE = re.compile(r"no allowed providers", re.IGNORECASE)
+# Request fields that let an OpenRouter request be served by another model than the one it names.
+OPENROUTER_ROUTING_FIELDS = ("models", "route")
+SERVED_BY_RE = re.compile(r'"provider"\s*:\s*"([^"]+)"')
 
 
 # Newer GPT-5.x models reject the legacy parameter name outright, and litellm
@@ -222,6 +237,19 @@ def classify(status, body_text):
         # A bare 429 with no usable text: treat as concurrency, the safer guess -
         # a wrong lock costs 2h, a wrong retry costs seconds.
         return "concurrency"
+    return "error"
+
+
+def classify_openrouter(status, body_text):
+    """Return 'ok', 'quota' (no credits), 'auth', 'transient' (rate limit or outage: wait and retry) or 'error'."""
+    if 200 <= status < 300:
+        return "ok"
+    if status == 402:
+        return "quota"
+    if status == 401:
+        return "auth"
+    if status in (408, 429) or status >= 500 or (status == 404 and NO_PROVIDER_RE.search(body_text)):
+        return "transient"
     return "error"
 
 
@@ -388,6 +416,10 @@ class Handler(BaseHTTPRequestHandler):
     waits = RunWaits()
     upstream = UPSTREAM_DEFAULT
     max_attempts = 12
+    provider = "kiconnect"
+    provider_order = ()       # openrouter: the only endpoints a request may be served by, in order
+    allowed_models = frozenset()   # when set, a model call for any other model is refused
+    retry_seconds = 1800      # openrouter: how long one request waits out rate limits and outages
 
     def log_message(self, *args):
         pass  # our own logging only
@@ -413,7 +445,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.rstrip("/") in ("", "/v1"):
             # the base URL itself: what sandbox.verify asks to see the proxy is reachable
-            payload = b'{"proxy": "kiconnect"}'
+            payload = json.dumps({"proxy": self.provider}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -434,12 +466,21 @@ class Handler(BaseHTTPRequestHandler):
             self._fail(403, "this proxy forwards model API calls only")
             return
         body, translate_back, requested_model = self._adapt_body(body)
+        if self.allowed_models and self.command == "POST" and requested_model not in self.allowed_models:
+            # the agent can reach this proxy with its own requests, so the lane's model is enforced here
+            log(f"refused a request for model {requested_model!r}: not this lane's model")
+            self._fail(403, "this proxy forwards its lane's model only")
+            return
         if translate_back:
             # chat-completions in, /responses out; the reply is converted back
             # so the caller never sees the difference.
             suffix = "/responses"
         target = self.upstream.rstrip("/") + suffix
-        for attempt in range(1, self.max_attempts + 1):
+        started = time.monotonic()
+        attempt = 0
+        transient = 0
+        while attempt < self.max_attempts:
+            attempt += 1
             self.waits.begin(run)
             try:
                 key = self.pool.acquire(model=requested_model or "")
@@ -459,7 +500,27 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     log(f"could not translate /responses reply: {exc}")
 
-            verdict = classify(status, text)
+            if self.provider == "openrouter":
+                verdict = classify_openrouter(status, text)
+                if verdict == "ok":
+                    served = SERVED_BY_RE.search(text[:20000])
+                    log(f"{requested_model} served by {served.group(1) if served else 'an unnamed endpoint'}")
+                if verdict == "transient" and time.monotonic() - started < self.retry_seconds:
+                    # the provider's capacity, not the agent's work: waited out off the agent's clock
+                    attempt -= 1
+                    transient += 1
+                    wait = min(60, 2 ** min(transient, 6))
+                    log(f"{status} for {requested_model}; retry in {wait}s")
+                    self.waits.begin(run)
+                    try:
+                        time.sleep(wait)
+                    finally:
+                        self.waits.end(run)
+                    continue
+                if verdict == "transient":
+                    verdict = "error"
+            else:
+                verdict = classify(status, text)
             if verdict == "quota":
                 self.pool.lock_out(key, requested_model or "")
                 continue                       # straight to another key
@@ -499,6 +560,8 @@ class Handler(BaseHTTPRequestHandler):
         is_chat = "chat/completions" in self.path
 
         stripped = [field for field in SERVER_SIDE_FIELDS if payload.pop(field, None) is not None]
+        if self.provider == "openrouter":
+            stripped += [field for field in OPENROUTER_ROUTING_FIELDS if payload.pop(field, None) is not None]
         tools = payload.get("tools")
         if isinstance(tools, list):
             kept = [t for t in tools if isinstance(t, dict) and t.get("type", "function") in CLIENT_TOOL_TYPES]
@@ -534,6 +597,14 @@ class Handler(BaseHTTPRequestHandler):
                         if isinstance(part, dict)
                     )
                     mutated = True
+
+        if self.provider == "openrouter":
+            if self.provider_order:
+                # the request may be served by the listed endpoints only, whatever it asked for itself
+                order = list(self.provider_order)
+                payload["provider"] = {"order": order, "only": order, "allow_fallbacks": True}
+                mutated = True
+            return (json.dumps(payload).encode("utf-8") if mutated else body), False, model
 
         if is_chat and needs_responses_api(model):
             payload.pop("stream", None)   # SSE is not emulated; force one-shot
@@ -622,27 +693,50 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8817)
     ap.add_argument("--bind", default="0.0.0.0")
-    ap.add_argument("--upstream", default=os.getenv("KICONNECT_UPSTREAM", UPSTREAM_DEFAULT))
+    ap.add_argument("--provider", choices=("kiconnect", "openrouter"), default="kiconnect")
+    ap.add_argument("--upstream", default=None,
+                    help="default: KICONNECT_UPSTREAM or KIConnect's API; OpenRouter's API with --provider openrouter")
+    ap.add_argument("--provider-order", action="append", default=[],
+                    help="openrouter: an endpoint allowed to serve the requests (repeatable, in order of "
+                         "preference); no other endpoint is used")
+    ap.add_argument("--allow-model", action="append", default=[],
+                    help="a model id the proxy forwards (repeatable); requests for any other model are "
+                         "refused. Default: any model")
+    ap.add_argument("--retry-seconds", type=int, default=1800,
+                    help="openrouter: how long one request waits out rate limits and outages")
     ap.add_argument("--lock-seconds", type=int, default=7200, help="lock duration after quota exhaustion")
     ap.add_argument("--max-concurrent", type=int, default=3, help="per-key concurrent request cap")
     ap.add_argument("--state-file", default="kiconnect_pool_state.json")
-    ap.add_argument("--key", action="append", default=[], help="repeatable; else KICONNECT_KEY1/2 from env")
+    ap.add_argument("--key", action="append", default=[],
+                    help="repeatable; else KICONNECT_KEY1/2 (OPENROUTER_API_KEY with --provider openrouter) from env")
     args = ap.parse_args()
 
     keys = list(args.key)
+    env_keys = ("OPENROUTER_API_KEY",) if args.provider == "openrouter" else \
+        ("KICONNECT_KEY1", "KICONNECT_KEY2", "KICONNECT_API_KEY")
     if not keys:
-        for var in ("KICONNECT_KEY1", "KICONNECT_KEY2", "KICONNECT_API_KEY"):
+        for var in env_keys:
             val = os.getenv(var)
             if val and val not in keys:
                 keys.append(val)
     if not keys:
-        sys.exit("no keys: pass --key or set KICONNECT_KEY1/KICONNECT_KEY2")
+        sys.exit(f"no keys: pass --key or set {' / '.join(env_keys)}")
+    upstream = args.upstream or (OPENROUTER_UPSTREAM if args.provider == "openrouter"
+                                 else os.getenv("KICONNECT_UPSTREAM", UPSTREAM_DEFAULT))
 
     Handler.pool = KeyPool(keys, args.lock_seconds, args.state_file, args.max_concurrent)
-    Handler.upstream = args.upstream
-    log(f"listening on {args.bind}:{args.port} -> {args.upstream}")
+    Handler.upstream = upstream
+    Handler.provider = args.provider
+    Handler.provider_order = tuple(e.strip() for item in args.provider_order for e in item.split(",") if e.strip())
+    Handler.allowed_models = frozenset(m.strip() for item in args.allow_model for m in item.split(",") if m.strip())
+    Handler.retry_seconds = args.retry_seconds
+    log(f"listening on {args.bind}:{args.port} -> {upstream} ({args.provider})")
     log(f"{len(keys)} key(s): {', '.join(k.split(':')[0][:8] for k in keys)}")
     log(f"lock={args.lock_seconds}s  max_concurrent={args.max_concurrent}/key")
+    if Handler.provider_order:
+        log(f"endpoints: {', '.join(Handler.provider_order)} only")
+    if Handler.allowed_models:
+        log(f"models: {', '.join(sorted(Handler.allowed_models))} only")
     ThreadingHTTPServer((args.bind, args.port), Handler).serve_forever()
 
 
