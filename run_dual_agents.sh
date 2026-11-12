@@ -41,6 +41,10 @@
 #   OPENROUTER_PROVIDER_ORDER         comma-separated OpenRouter endpoints that
 #                                     alone may serve opencode's requests
 #   OPENCODE_PROXY_PORT               default: 8818 (OpenRouter proxy)
+#   OPENROUTER_LOCK_SECONDS           how long a spent credit balance is
+#                                     assumed to stay spent (default: 1800)
+#   MAX_QUOTA_SLEEPS                  quota waits on one task before a lane
+#                                     moves to the next (default: 5)
 #   OPENCODE_PROXY_URL                container-side URL of that proxy (default:
 #                                     OPENHANDS_PROXY_URL with its port, else
 #                                     host.docker.internal)
@@ -185,7 +189,9 @@ if [[ "$want_openrouter_proxy" == "1" ]]; then
         echo "ERROR: OPENCODE_PROVIDER=openrouter needs OPENROUTER_API_KEY"; exit 1
     fi
     # The key goes through the environment, not the command line, so it stays out of `ps`.
-    OR_ARGS=(--provider openrouter --lock-seconds "$LOCK_SECONDS" --max-concurrent 8
+    # A spent credit balance is checked again every OPENROUTER_LOCK_SECONDS (default 30 min): credits come
+    # back only when someone adds them, so there is no window to wait out.
+    OR_ARGS=(--provider openrouter --lock-seconds "${OPENROUTER_LOCK_SECONDS:-1800}" --max-concurrent 8
              --state-file "$LOG_DIR/openrouter_pool_state.json")
     [[ -n "$OPENROUTER_PROVIDER_ORDER" ]] && OR_ARGS+=(--provider-order "$OPENROUTER_PROVIDER_ORDER")
     IFS=',' read -ra _models <<< "$OPENCODE_MODELS"

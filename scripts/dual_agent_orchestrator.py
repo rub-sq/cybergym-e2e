@@ -190,6 +190,8 @@ def already_done(task, output_dir):
         return True
     if data.get("status") == "sandbox_error":
         return False   # no agent was started
+    if data.get("status") == "quota_exhausted":
+        return False   # run_agent.py resumes it at the attempt the quota interrupted
     if safeguard_flagged(task, output_dir):
         return False   # never reached the model; retry it
     return data.get("duration_seconds", 0) >= 60

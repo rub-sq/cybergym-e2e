@@ -88,6 +88,10 @@ AUTH_RE = re.compile("|".join(AUTH_PATTERNS), re.IGNORECASE)
 # "No allowed providers are available", which is an outage to wait out like a 5xx.
 OPENROUTER_UPSTREAM = "https://openrouter.ai/api/v1"
 NO_PROVIDER_RE = re.compile(r"no allowed providers", re.IGNORECASE)
+# A 403 for a key whose own spending limit is reached: like a 402, only more credit helps.
+KEY_LIMIT_RE = re.compile(r"key limit|limit exceeded", re.IGNORECASE)
+# What the agent is told while OpenRouter has no credits; cli_failures reads "no key available" as a spent quota.
+NO_CREDITS_MESSAGE = "no key available: OpenRouter has no credits left for this key"
 # Request fields that let an OpenRouter request be served by another model than the one it names.
 OPENROUTER_ROUTING_FIELDS = ("models", "route")
 SERVED_BY_RE = re.compile(r'"provider"\s*:\s*"([^"]+)"')
@@ -244,7 +248,7 @@ def classify_openrouter(status, body_text):
     """Return 'ok', 'quota' (no credits), 'auth', 'transient' (rate limit or outage: wait and retry) or 'error'."""
     if 200 <= status < 300:
         return "ok"
-    if status == 402:
+    if status == 402 or (status == 403 and KEY_LIMIT_RE.search(body_text)):
         return "quota"
     if status == 401:
         return "auth"
@@ -341,6 +345,13 @@ class KeyPool:
         with self._lock:
             self._inflight[key] = max(0, self._inflight[key] - 1)
             self._lock.notify_all()
+
+    def locked_for(self, model=""):
+        """Seconds until a key is usable for `model` again when every key is locked for it, else 0."""
+        now = time.time()
+        with self._lock:
+            waits = [self._locked_until.get((k, model), 0.0) - now for k in self._keys]
+        return int(min(waits)) if waits and min(waits) > 0 else 0
 
     def lock_out(self, key, model="", reason="quota exhausted"):
         with self._lock:
@@ -481,6 +492,12 @@ class Handler(BaseHTTPRequestHandler):
         transient = 0
         while attempt < self.max_attempts:
             attempt += 1
+            if self.provider == "openrouter" and self.pool.locked_for(requested_model or ""):
+                # Credits come back only when someone adds them: the agent is answered at once instead of
+                # being held for the lock, and its lane waits (cli_failures, the orchestrator).
+                self._fail(402, f"{NO_CREDITS_MESSAGE}; next try in "
+                                f"{self.pool.locked_for(requested_model or '')}s")
+                return
             self.waits.begin(run)
             try:
                 key = self.pool.acquire(model=requested_model or "")
@@ -519,6 +536,10 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 if verdict == "transient":
                     verdict = "error"
+                if verdict == "quota":
+                    self.pool.lock_out(key, requested_model or "", f"no credits ({status})")
+                    self._fail(402, f"{NO_CREDITS_MESSAGE} ({status} upstream)")
+                    return
             else:
                 verdict = classify(status, text)
             if verdict == "quota":

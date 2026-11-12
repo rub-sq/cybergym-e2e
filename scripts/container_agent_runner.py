@@ -31,6 +31,7 @@ from cli_failures import (
     ClaudeQuotaExhausted,
     OpencodeAuthError,
     OpencodeQuotaExhausted,
+    POOL_EXHAUSTED_RE,
     classify_claude_output,
     classify_opencode_output,
     compute_wake_at,
@@ -354,8 +355,9 @@ def run_opencode_in_container(container_id, repo_to_patch, prompt, model,
     if log_path:
         Path(log_path).write_text(output, encoding="utf-8")
 
-    # 3. Hard failures first: auth and quota raise.
-    if code != 0:
+    # 3. Hard failures first: auth and quota raise. The proxy's own "no key available" reply is read whatever the
+    #    exit code, since opencode can end a session whose model calls failed with exit 0.
+    if code != 0 or POOL_EXHAUSTED_RE.search(output):
         verdict = classify_opencode_output(output)
         if verdict == "auth":
             raise OpencodeAuthError(

@@ -45,6 +45,8 @@ TRANSIENT_PATTERNS = (
 )
 
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))}
 CLOCK_PATTERN = (
     r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)?"
     r"(?:\s*\((?P<timezone>[A-Za-z_]+(?:/[A-Za-z0-9_+.-]+)+)\))?"
@@ -137,6 +139,45 @@ def parse_quota_reset(text, now=None):
             return QuotaReset(parsed.astimezone(timezone.utc), iso.group(0))
         except ValueError:
             pass
+
+    relative = re.search(
+        r"reset(?:s)?\s+in\s+(?:(?P<days>\d+)\s*d(?:ays?)?\s*)?(?:(?P<hours>\d+)\s*h(?:(?:ou)?rs?)?\s*)?"
+        r"(?:(?P<minutes>\d+)\s*m(?:in(?:ute)?s?)?)?",
+        lower,
+    )
+    if relative and any(relative.group(g) for g in ("days", "hours", "minutes")):
+        delta = timedelta(days=int(relative.group("days") or 0), hours=int(relative.group("hours") or 0),
+                          minutes=int(relative.group("minutes") or 0))
+        return QuotaReset(now + delta, relative.group(0))
+
+    month_day = re.search(
+        r"reset(?:s)?(?:\s+(?:at|on))?\s+"
+        r"\b(?P<month>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(?P<day>\d{1,2})"
+        r"(?:st|nd|rd|th)?,?(?:\s+at)?\s+" + CLOCK_PATTERN,
+        text,
+        re.IGNORECASE,
+    )
+    if month_day:
+        clock = _resolve_clock(month_day)
+        tz = _resolve_timezone(month_day)
+        if clock and tz:
+            hour, minute = clock
+            local_now = now.astimezone(tz)
+            month, day = MONTHS[month_day.group("month").lower()], int(month_day.group("day"))
+            for year in (local_now.year, local_now.year + 1):
+                try:
+                    cand = local_now.replace(year=year, month=month, day=day, hour=hour, minute=minute,
+                                             second=0, microsecond=0)
+                except ValueError:
+                    break
+                if cand > local_now:
+                    return QuotaReset(cand.astimezone(timezone.utc), month_day.group(0))
+
+    epoch = re.search(r"limit reached\|(?P<epoch>\d{10})\b", text, re.IGNORECASE)
+    if epoch:
+        stamp = datetime.fromtimestamp(int(epoch.group("epoch")), tz=timezone.utc)
+        if stamp > now:
+            return QuotaReset(stamp, epoch.group(0))
 
     weekday = re.search(
         r"reset(?:s)?(?:\s+(?:at|on))?\s+"

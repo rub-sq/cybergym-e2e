@@ -54,10 +54,14 @@ from utils import (
 # Default budget per task in seconds (120 minutes), shared by every attempt
 DEFAULT_TIMEOUT = 7200
 # Agent releases the lanes install (the install scripts read them from the environment)
-CLAUDE_CODE_VERSION = "2.1.314"
-OPENCODE_VERSION = "2.2.3"
+CLAUDE_CODE_VERSION = "2.1.323"
+OPENCODE_VERSION = "2.2.7"
 # run_agent()'s exit code when the agent's container could not be locked down (see scripts/sandbox.py)
 SANDBOX_EXIT = 127
+# run_agent()'s exit code when the account's quota ran out under the agent
+QUOTA_EXIT = 125
+# Written to the run directory when a spent quota interrupts a task: what the next invocation resumes from
+RESUME_FILE = "resume.json"
 
 
 # =============================================================================
@@ -975,7 +979,7 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
         # until the subscription window reopens instead of blind polling.
         print(f"CLAUDE_QUOTA_EXHAUSTED wake_at={e.wake_at.isoformat()}")
         print(f"  Claude quota exhausted; resume at {e.wake_at.isoformat()}")
-        return 125, None, None, None, container_id, 0, 0.0, None
+        return QUOTA_EXIT, None, None, None, container_id, 0, 0.0, None
     except cli_failures.ClaudeAuthError as e:
         print(f"CLAUDE_AUTH_ERROR {e}")
         return 126, None, None, None, container_id, 0, 0.0, None
@@ -983,8 +987,8 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
         # Same marker the claude lane uses: the orchestrator's QUOTA_MARKER
         # picks it up and sleeps until the proxy pool frees a key.
         print(f"CLAUDE_QUOTA_EXHAUSTED wake_at={e.wake_at.isoformat()}")
-        print(f"  opencode/kiconnect quota exhausted; resume at {e.wake_at.isoformat()}")
-        return 125, None, None, None, container_id, 0, 0.0, None
+        print(f"  opencode quota exhausted; resume at {e.wake_at.isoformat()}")
+        return QUOTA_EXIT, None, None, None, container_id, 0, 0.0, None
     except cli_failures.OpencodeAuthError as e:
         print(f"OPENCODE_AUTH_ERROR {e}")
         return 126, None, None, None, container_id, 0, 0.0, None
@@ -1006,8 +1010,42 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
 # Main agent loop
 # =============================================================================
 
-def run_agent_loop(args, config, script_path, data_path, run_dir):
-    """Run agent with optional feedback loop."""
+def _keep_interrupted_log(trajectory_dir, attempt):
+    """Rename an interrupted attempt's log so the attempt's rerun does not overwrite it; returns how many
+    interruptions this attempt has had."""
+    previous = len(list(trajectory_dir.glob(f"attempt_{attempt}_quota_*.log")))
+    log = trajectory_dir / f"attempt_{attempt}.log"
+    if log.is_file():
+        log.rename(trajectory_dir / f"attempt_{attempt}_quota_{previous + 1}.log")
+    return previous + 1
+
+
+def resumable_run(task_dir, run_key):
+    """The task's latest run directory and the state to resume from, when a spent quota interrupted that run
+    and it was made with the same agent, model and settings; else (None, None)."""
+    if not task_dir.is_dir():
+        return None, None
+    runs = sorted(p for p in task_dir.iterdir() if p.is_dir())
+    if not runs:
+        return None, None
+    latest = runs[-1]
+    try:
+        summary = json.loads((latest / "summary.json").read_text())
+        resume = json.loads((latest / RESUME_FILE).read_text())
+    except (OSError, ValueError):
+        return None, None
+    if summary.get("status") != "quota_exhausted" or resume.get("run_key") != run_key:
+        return None, None
+    resume["previous_duration"] = float(summary.get("duration_seconds") or 0.0)
+    return latest, resume
+
+
+def run_agent_loop(args, config, script_path, data_path, run_dir, resume=None, run_key=""):
+    """Run agent with optional feedback loop.
+
+    resume: the state a spent quota left (see resumable_run): the attempts it finished stand, and the attempt it
+    interrupted starts over with the feedback it had.
+    """
     output_dir = run_dir / "output"
     trajectory_dir = run_dir / "trajectory"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1021,6 +1059,14 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
     all_attempts = []
     validation_containers = []
     agent_container_id = None
+    first_attempt = 1
+    interruptions = 0
+    if resume:
+        first_attempt = int(resume["attempt"])
+        feedback = resume.get("feedback", "")
+        all_attempts = list(resume.get("attempts", []))
+        interruptions = int(resume.get("interruptions", 0))
+        print(f"  Resuming at attempt {first_attempt} after {interruptions} quota interruption(s)")
 
     # --timeout is the TOTAL budget per task, shared by every attempt. It counts
     # what the attempts spend working: the agent's run, minus its waits for a
@@ -1029,10 +1075,10 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
     # count. An attempt gets what is left and runs only if that is a meaningful
     # slice; a validation that starts in time always finishes.
     MIN_ATTEMPT = 600
-    charged = 0.0
+    charged = float(resume.get("charged", 0.0)) if resume else 0.0
 
     try:
-        for attempt in range(1, args.max_attempts + 1):
+        for attempt in range(first_attempt, args.max_attempts + 1):
             # A previous attempt's container survives when its output was
             # missing and the loop continued early (or the run hit a quota
             # error) - remove it so failed tasks do not leak containers.
@@ -1073,6 +1119,20 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
             exit_code, poc_file, patch_file, log_file, agent_container_id, agent_exec_time, key_wait, network = run_agent(
                 attempt_args, config, script_path, data_path, prompt, attempt, work_dir, trajectory_dir
             )
+            if exit_code == QUOTA_EXIT:
+                # The account ran out of quota under the agent, which says nothing about the model: the attempt
+                # is not recorded or charged, and the next invocation reruns it once the quota is back.
+                interruptions += 1
+                _keep_interrupted_log(trajectory_dir, attempt)
+                (run_dir / RESUME_FILE).write_text(json.dumps({
+                    "run_key": run_key,
+                    "attempt": attempt,
+                    "feedback": feedback,
+                    "attempts": all_attempts,
+                    "charged": charged,
+                    "interruptions": interruptions,
+                }, indent=2))
+                return "quota_exhausted", all_attempts
             charged += max(0.0, agent_exec_time - key_wait)
 
             agent_time = time.time() - agent_start
@@ -1291,13 +1351,8 @@ Examples:
         print("WARNING: Using iterative prompt with OpenHands. Agent will try to test but may fail.")
         print("         Consider using --prompt-style no-test for OpenHands.")
 
-    # Setup output directories
     task_name = args.task_path.replace("/", "_")
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    mode_suffix = "e2e" if args.mode == "e2e" else "patch"
-    iter_suffix = f"_x{args.max_attempts}" if args.max_attempts > 1 else ""
-    run_dir = Path(args.agent_output) / task_name / f"{timestamp}_{mode_suffix}{iter_suffix}"
-    run_dir.mkdir(parents=True, exist_ok=True)
 
     # Litellm create key
     generated_api_key = None
@@ -1331,6 +1386,15 @@ Examples:
             aws_profile=args.aws_profile,
         )
 
+    # Setup output directories. A run that a spent quota interrupted is continued in its own directory.
+    run_key = f"{args.agent}|{llm_model}|{args.mode}|{args.prompt_style}|{args.max_attempts}|{args.timeout}"
+    run_dir, resume = resumable_run(Path(args.agent_output) / task_name, run_key)
+    if run_dir is None:
+        mode_suffix = "e2e" if args.mode == "e2e" else "patch"
+        iter_suffix = f"_x{args.max_attempts}" if args.max_attempts > 1 else ""
+        run_dir = Path(args.agent_output) / task_name / f"{timestamp}_{mode_suffix}{iter_suffix}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
     print(f"Task: {args.task_path}")
     print(f"Agent: {args.agent}")
     print(f"Prompt style: {args.prompt_style}")
@@ -1350,10 +1414,18 @@ Examples:
     data_path = Path(args.data_dir) / args.task_path
 
     # Run agent
-    final_status, all_attempts = run_agent_loop(args, config, script_path, data_path, run_dir)
+    final_status, all_attempts = run_agent_loop(args, config, script_path, data_path, run_dir,
+                                                resume=resume, run_key=run_key)
 
-    # Save summary
-    duration = time.time() - start_time
+    # Save summary. The duration adds up the invocations of a resumed run; the waits for quota between them
+    # are not in it.
+    duration = time.time() - start_time + (resume["previous_duration"] if resume else 0.0)
+    resume_file = run_dir / RESUME_FILE
+    interruptions = int(resume.get("interruptions", 0)) if resume else 0
+    if final_status == "quota_exhausted":
+        interruptions = int(json.loads(resume_file.read_text()).get("interruptions", interruptions))
+    elif resume_file.exists():
+        resume_file.unlink()
     summary = {
         "task": args.task_path,
         "agent": args.agent,
@@ -1369,6 +1441,8 @@ Examples:
         "duration_minutes": round(duration / 60, 2),
         "output_dir": str(run_dir.absolute()),
         "model": llm_model,
+        # attempts that a spent quota interrupted and that were run again from their start
+        "quota_interruptions": interruptions,
     }
 
     # Litellm delete key
