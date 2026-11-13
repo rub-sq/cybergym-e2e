@@ -190,8 +190,8 @@ def already_done(task, output_dir):
         return True
     if data.get("status") == "sandbox_error":
         return False   # no agent was started
-    if data.get("status") == "quota_exhausted":
-        return False   # run_agent.py resumes it at the attempt the quota interrupted
+    if data.get("status") in ("quota_exhausted", "endpoint_unreachable"):
+        return False   # run_agent.py resumes it at the attempt that was interrupted
     if safeguard_flagged(task, output_dir):
         return False   # never reached the model; retry it
     return data.get("duration_seconds", 0) >= 60
@@ -199,6 +199,10 @@ def already_done(task, output_dir):
 
 # --- lanes ------------------------------------------------------------------
 QUOTA_MARKER = re.compile(r"CLAUDE_QUOTA_EXHAUSTED wake_at=(\S+)")
+# _run_task's answer when the lock held but the model endpoint did not answer: the lane waits, the others go on
+ENDPOINT_DOWN = object()
+# Why STOP was set, for the summary at the end
+STOP_REASON = []
 
 
 class Lane(threading.Thread):
@@ -220,6 +224,9 @@ class Lane(threading.Thread):
         self.pre_done = 0
         self.max_safeguard_retries = int(os.getenv("SAFEGUARD_RETRIES", "3"))
         self.max_quota_sleeps = int(os.getenv("MAX_QUOTA_SLEEPS", "5"))
+        # 5, 10, 20, 30, 30 and 30 minutes: about two hours of outage before the lane gives up
+        self.max_endpoint_waits = int(os.getenv("MAX_ENDPOINT_WAITS", "6"))
+        self.stop_reason = ""
 
     def run(self):
         try:
@@ -242,6 +249,7 @@ class Lane(threading.Thread):
         index = 0
         attempts_here = 0          # safeguard retries spent on self.tasks[index]
         quota_sleeps = 0           # consecutive quota waits on self.tasks[index]
+        endpoint_waits = 0         # consecutive waits for the model endpoint on self.tasks[index]
         while index < len(self.tasks) and not STOP.is_set():
             task = self.tasks[index]
             if already_done(task, self.output_dir):
@@ -257,6 +265,18 @@ class Lane(threading.Thread):
                 # multi-hour wait would stop the DiskGate from ever draining
                 # (it waits for active==0) and deadlock the other lane.
                 self.gate.release()
+            if wake_at is ENDPOINT_DOWN:
+                endpoint_waits += 1
+                if endpoint_waits > self.max_endpoint_waits:
+                    self.stop_reason = (f"the model endpoint did not answer for {task} after "
+                                        f"{self.max_endpoint_waits} waits; this lane stopped, run it again to go on")
+                    log(self.lane, self.stop_reason)
+                    break
+                pause = min(300 * 2 ** (endpoint_waits - 1), 1800)
+                wake = (datetime.now(timezone.utc) + timedelta(seconds=pause)).isoformat()
+                self._sleep_until(wake, task, reason="model endpoint did not answer")
+                continue          # same task, same attempt, once the wait is over
+            endpoint_waits = 0
             if wake_at:
                 quota_sleeps += 1
                 if quota_sleeps > self.max_quota_sleeps:
@@ -320,11 +340,16 @@ class Lane(threading.Thread):
             except OSError as exc:
                 log(self.lane, f"could not write task log ({exc}); continuing")
 
+        if "ENDPOINT_UNREACHABLE" in output:
+            log(self.lane, f"    {task}: the lock held, but the model endpoint did not answer (see the task log)")
+            return ENDPOINT_DOWN
+
         if "SANDBOX_ERROR" in output:
             # The agent's container could not be locked down. Running on would hand the
             # next tasks to agents with an open network, or fail every one the same way.
-            log(self.lane, "an agent's container could not be locked down - stopping all lanes "
-                           "(see the task log; check with: python3 scripts/sandbox.py --check)")
+            STOP_REASON.append(f"{self.lane}: the container of {task} could not be locked down; all lanes stopped "
+                               "(see the task log; check with: python3 scripts/sandbox.py --check)")
+            log(self.lane, STOP_REASON[-1])
             STOP.set()
             return None
 
@@ -333,7 +358,8 @@ class Lane(threading.Thread):
             if match:
                 return match.group(1)
             if "CLAUDE_AUTH_ERROR" in output:
-                log(self.lane, "claude is not logged in - stopping this lane")
+                STOP_REASON.append(f"{self.lane}: claude is not logged in; all lanes stopped")
+                log(self.lane, STOP_REASON[-1])
                 STOP.set()
                 return None
 
@@ -342,7 +368,7 @@ class Lane(threading.Thread):
         log(self.lane, f"    {task} -> {verdict} in {mins:.1f}m")
         return None
 
-    def _sleep_until(self, iso_time, task, escalate=1):
+    def _sleep_until(self, iso_time, task, escalate=1, reason="quota exhausted"):
         try:
             wake = datetime.fromisoformat(iso_time)
         except ValueError:
@@ -363,7 +389,7 @@ class Lane(threading.Thread):
             if remaining <= 0:
                 break
             log(self.lane,
-                f"quota exhausted on {task}; sleeping {remaining/60:.0f}m "
+                f"{reason} on {task}; sleeping {remaining/60:.0f}m "
                 f"until {wake.astimezone().strftime('%H:%M')} (other lane keeps running)")
             STOP.wait(min(remaining, 600))
         self.blocked_until = None
@@ -482,6 +508,7 @@ def main():
 
     def handle_signal(signum, frame):
         log("main", "stop requested; finishing current tasks then exiting")
+        STOP_REASON.append("stop requested (signal)")
         STOP.set()
 
     signal.signal(signal.SIGINT, handle_signal)
@@ -573,6 +600,10 @@ def main():
     print("=" * 68)
     for lane in lanes:
         print(f"  {lane.lane:<10} {lane.done} run, {lane.skipped} skipped")
+        if lane.stop_reason:
+            print(f"  {'':<10} STOPPED EARLY: {lane.stop_reason}")
+    for reason in STOP_REASON:
+        print(f"  STOPPED EARLY: {reason}")
     print(f"  free disk       : {free_gb():.0f}G")
     print("=" * 68)
 

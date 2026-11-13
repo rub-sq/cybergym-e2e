@@ -45,6 +45,9 @@
 #                                     assumed to stay spent (default: 1800)
 #   MAX_QUOTA_SLEEPS                  quota waits on one task before a lane
 #                                     moves to the next (default: 5)
+#   MAX_ENDPOINT_WAITS                waits for a model endpoint that does not
+#                                     answer (5, 10, 20, then 30 min) before
+#                                     that lane stops (default: 6)
 #   OPENCODE_PROXY_URL                container-side URL of that proxy (default:
 #                                     OPENHANDS_PROXY_URL with its port, else
 #                                     host.docker.internal)

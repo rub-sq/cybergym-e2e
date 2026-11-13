@@ -60,8 +60,13 @@ OPENCODE_VERSION = "2.2.7"
 SANDBOX_EXIT = 127
 # run_agent()'s exit code when the account's quota ran out under the agent
 QUOTA_EXIT = 125
-# Written to the run directory when a spent quota interrupts a task: what the next invocation resumes from
+# run_agent()'s exit code when the lock held but the model endpoint did not answer; no agent was started
+ENDPOINT_EXIT = 123
+# Written to the run directory when a spent quota or an unreachable endpoint interrupts a task: what the next
+# invocation resumes from
 RESUME_FILE = "resume.json"
+# The statuses of an interrupted run, keyed by the exit code that interrupts it
+INTERRUPTED = {QUOTA_EXIT: "quota_exhausted", ENDPOINT_EXIT: "endpoint_unreachable"}
 
 
 # =============================================================================
@@ -992,6 +997,11 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
     except cli_failures.OpencodeAuthError as e:
         print(f"OPENCODE_AUTH_ERROR {e}")
         return 126, None, None, None, container_id, 0, 0.0, None
+    except sandbox.EndpointUnreachable as e:
+        # A network outage says nothing about the model: the orchestrator waits and resumes this attempt.
+        print("ENDPOINT_UNREACHABLE the lock held, but the model endpoint did not answer; the agent was not started")
+        print(e)
+        return ENDPOINT_EXIT, None, None, None, container_id, 0, 0.0, None
     except sandbox.SandboxError as e:
         # The same failure would hit every task: the orchestrator stops on this marker instead of
         # recording task after task as failed by the model.
@@ -1034,7 +1044,7 @@ def resumable_run(task_dir, run_key):
         resume = json.loads((latest / RESUME_FILE).read_text())
     except (OSError, ValueError):
         return None, None
-    if summary.get("status") != "quota_exhausted" or resume.get("run_key") != run_key:
+    if summary.get("status") not in INTERRUPTED.values() or resume.get("run_key") != run_key:
         return None, None
     resume["previous_duration"] = float(summary.get("duration_seconds") or 0.0)
     return latest, resume
@@ -1061,12 +1071,15 @@ def run_agent_loop(args, config, script_path, data_path, run_dir, resume=None, r
     agent_container_id = None
     first_attempt = 1
     interruptions = 0
+    endpoint_waits = 0
     if resume:
         first_attempt = int(resume["attempt"])
         feedback = resume.get("feedback", "")
         all_attempts = list(resume.get("attempts", []))
         interruptions = int(resume.get("interruptions", 0))
-        print(f"  Resuming at attempt {first_attempt} after {interruptions} quota interruption(s)")
+        endpoint_waits = int(resume.get("endpoint_waits", 0))
+        print(f"  Resuming at attempt {first_attempt} after {interruptions} quota interruption(s) "
+              f"and {endpoint_waits} unreachable endpoint(s)")
 
     # --timeout is the TOTAL budget per task, shared by every attempt. It counts
     # what the attempts spend working: the agent's run, minus its waits for a
@@ -1119,11 +1132,15 @@ def run_agent_loop(args, config, script_path, data_path, run_dir, resume=None, r
             exit_code, poc_file, patch_file, log_file, agent_container_id, agent_exec_time, key_wait, network = run_agent(
                 attempt_args, config, script_path, data_path, prompt, attempt, work_dir, trajectory_dir
             )
-            if exit_code == QUOTA_EXIT:
-                # The account ran out of quota under the agent, which says nothing about the model: the attempt
-                # is not recorded or charged, and the next invocation reruns it once the quota is back.
-                interruptions += 1
-                _keep_interrupted_log(trajectory_dir, attempt)
+            if exit_code in INTERRUPTED:
+                # The account ran out of quota under the agent, or the endpoint did not answer before it started.
+                # Neither says anything about the model: the attempt is not recorded or charged, and the next
+                # invocation reruns it.
+                if exit_code == QUOTA_EXIT:
+                    interruptions += 1
+                    _keep_interrupted_log(trajectory_dir, attempt)
+                else:
+                    endpoint_waits += 1
                 (run_dir / RESUME_FILE).write_text(json.dumps({
                     "run_key": run_key,
                     "attempt": attempt,
@@ -1131,8 +1148,9 @@ def run_agent_loop(args, config, script_path, data_path, run_dir, resume=None, r
                     "attempts": all_attempts,
                     "charged": charged,
                     "interruptions": interruptions,
+                    "endpoint_waits": endpoint_waits,
                 }, indent=2))
-                return "quota_exhausted", all_attempts
+                return INTERRUPTED[exit_code], all_attempts
             charged += max(0.0, agent_exec_time - key_wait)
 
             agent_time = time.time() - agent_start
@@ -1386,7 +1404,8 @@ Examples:
             aws_profile=args.aws_profile,
         )
 
-    # Setup output directories. A run that a spent quota interrupted is continued in its own directory.
+    # Setup output directories. A run that a spent quota or an unreachable endpoint interrupted is continued in
+    # its own directory.
     run_key = f"{args.agent}|{llm_model}|{args.mode}|{args.prompt_style}|{args.max_attempts}|{args.timeout}"
     run_dir, resume = resumable_run(Path(args.agent_output) / task_name, run_key)
     if run_dir is None:
@@ -1422,8 +1441,11 @@ Examples:
     duration = time.time() - start_time + (resume["previous_duration"] if resume else 0.0)
     resume_file = run_dir / RESUME_FILE
     interruptions = int(resume.get("interruptions", 0)) if resume else 0
-    if final_status == "quota_exhausted":
-        interruptions = int(json.loads(resume_file.read_text()).get("interruptions", interruptions))
+    endpoint_waits = int(resume.get("endpoint_waits", 0)) if resume else 0
+    if final_status in INTERRUPTED.values():
+        state = json.loads(resume_file.read_text())
+        interruptions = int(state.get("interruptions", interruptions))
+        endpoint_waits = int(state.get("endpoint_waits", endpoint_waits))
     elif resume_file.exists():
         resume_file.unlink()
     summary = {
@@ -1443,6 +1465,8 @@ Examples:
         "model": llm_model,
         # attempts that a spent quota interrupted and that were run again from their start
         "quota_interruptions": interruptions,
+        # attempts put off because the model endpoint did not answer before the agent started
+        "endpoint_interruptions": endpoint_waits,
     }
 
     # Litellm delete key

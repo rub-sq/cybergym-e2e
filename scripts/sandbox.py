@@ -119,10 +119,15 @@ fi
 code=$(http -6 https://github.com)
 if [ -n "$code" ] && [ "$code" != 000 ]; then bad "IPv6 egress is open"; else ok "blocked: IPv6"; fi
 
+# A single unanswered request is often a blip on the host's uplink, so the endpoint gets four tries.
 for url in $ALLOWED; do
-  code=$(curl -sk -m 15 -o /dev/null -w '%{http_code}' "$url" 2>/tmp/.endpoint.err || true)
+  for try in 1 2 3 4; do
+    code=$(curl -sSk -m 15 -o /dev/null -w '%{http_code}' "$url" 2>/tmp/.endpoint.err || true)
+    { [ -z "$code" ] || [ "$code" = 000 ]; } || break
+    [ $try -lt 4 ] && sleep 10
+  done
   if [ -z "$code" ] || [ "$code" = 000 ]; then bad "model endpoint not reachable: $url ($(tr '\n' ' ' < /tmp/.endpoint.err))"
-  else ok "model endpoint reachable: $url (HTTP $code)"; fi
+  else ok "model endpoint reachable: $url (HTTP $code, try $try)"; fi
 done
 rm -f /tmp/.endpoint.err
 exit $fail
@@ -131,6 +136,13 @@ exit $fail
 
 class SandboxError(RuntimeError):
     """The container could not be locked down, or the lock did not hold."""
+
+
+class EndpointUnreachable(SandboxError):
+    """The lock held, but a model endpoint did not answer: a network outage, not a hole in the lock."""
+
+
+_UNREACHABLE = "FAIL: model endpoint not reachable"
 
 
 def endpoint(url: str) -> tuple[str, int]:
@@ -173,7 +185,7 @@ def lock(container_id: str, urls: list[str]) -> dict:
                                  verbose=False, workdir="/")
             addresses = out.split()
             if not addresses:
-                raise SandboxError(f"cannot resolve {host} inside the container")
+                raise EndpointUnreachable(f"cannot resolve {host} inside the container")
             pins += [f"{address} {host}" for address in addresses]
         rules += [f"{address}:{port}" for address in addresses]
         allowed.append({"host": host, "port": port, "addresses": addresses})
@@ -248,6 +260,9 @@ def lock_and_verify(container_id: str, urls: list[str], repo: str | None = None)
     passed, report = verify(container_id, urls, repo=repo)
     record["verified"] = passed
     if not passed:
+        failures = [line for line in report.splitlines() if line.startswith("FAIL")]
+        if failures and all(line.startswith(_UNREACHABLE) for line in failures):
+            raise EndpointUnreachable("the lock held, but the model endpoint did not answer:\n" + report)
         raise SandboxError("the network lock did not hold:\n" + report)
     return record
 
