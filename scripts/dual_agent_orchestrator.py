@@ -190,8 +190,8 @@ def already_done(task, output_dir):
         return True
     if data.get("status") == "sandbox_error":
         return False   # no agent was started
-    if data.get("status") in ("quota_exhausted", "endpoint_unreachable"):
-        return False   # run_agent.py resumes it at the attempt that was interrupted
+    if data.get("status") in ("quota_exhausted", "endpoint_unreachable", "requeued"):
+        return False   # run_agent.py resumes it at the attempt that was interrupted or requeued
     if safeguard_flagged(task, output_dir):
         return False   # never reached the model; retry it
     return data.get("duration_seconds", 0) >= 60

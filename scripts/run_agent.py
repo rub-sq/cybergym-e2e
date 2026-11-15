@@ -41,6 +41,7 @@ from pathlib import Path
 import cli_failures
 import container_agent_runner
 import key_wait_clock
+import oracle_feedback
 import sandbox
 
 import tomli
@@ -67,6 +68,9 @@ ENDPOINT_EXIT = 123
 RESUME_FILE = "resume.json"
 # The statuses of an interrupted run, keyed by the exit code that interrupts it
 INTERRUPTED = {QUOTA_EXIT: "quota_exhausted", ENDPOINT_EXIT: "endpoint_unreachable"}
+# A run set up to rerun from a given attempt (scripts/requeue_attempt.py); it resumes like an interrupted one
+REQUEUED = "requeued"
+RESUMABLE = (*INTERRUPTED.values(), REQUEUED)
 
 
 # =============================================================================
@@ -117,8 +121,9 @@ def format_feedback(results, attempt, mode, poc_file=None, patch_file=None, traj
                 continue
             feedback += f"\n{stage_name.upper()} ({stage_descriptions[stage_name]}): {status.upper()}\n"
     else:
-        status = results.get("stage3")
-        feedback += f"\nTEST VALIDATION: {status.upper() if status else 'N/A'}\n"
+        # The oracle's verdict, as agentic-redblue's Blue Team gets it (scripts/oracle_feedback.py).
+        failure = oracle_feedback.verdict(results)
+        feedback += "\nPASSED\n" if failure is None else f"\nFAILED: {failure}\n"
 
     feedback += "\n\nGUIDANCE:\n"
     if mode == "e2e":
@@ -374,10 +379,11 @@ def run_final_validation(poc_path, patch_path, data_path, script_path, build_ima
         mode: "e2e" or "patch-only"
 
     Returns:
-        dict with stage1, stage2, stage3, stage4 status values
+        dict with stage1, stage2, stage3, stage4 status values, and under "details" what each failed stage
+        reported (step, exit code, output) for the agent's feedback
     """
     scripts_dir = Path(__file__).parent.absolute()
-    results = {"stage1": None, "stage2": None, "stage3": None, "stage4": None}
+    results = {"stage1": None, "stage2": None, "stage3": None, "stage4": None, "details": {}}
 
     # Determine which stages to run
     if mode == "e2e":
@@ -393,7 +399,9 @@ def run_final_validation(poc_path, patch_path, data_path, script_path, build_ima
         if stage == 3 and mode == "e2e" and results.get("stage2") != "passed":
             results["stage3"] = "skipped"
             continue
-        if stage == 4 and results.get("stage3") != "passed":
+        # In patch-only mode a patch whose tests fail still gets its PoC run, as the Blue Team's oracle runs the
+        # PoC before the suite: the feedback can then say whether the crash is gone. Success still needs both.
+        if stage == 4 and results.get("stage3") != "passed" and (mode == "e2e" or results.get("stage3") != "failed"):
             results["stage4"] = "skipped"
             continue
 
@@ -446,6 +454,9 @@ def run_final_validation(poc_path, patch_path, data_path, script_path, build_ima
                         with open(tmp_path) as f:
                             stage_results = json.load(f)
                             results[f"stage{stage}"] = stage_results.get(f"stage{stage}")
+                            detail = (stage_results.get("details") or {}).get(f"stage{stage}")
+                            if detail:
+                                results["details"][f"stage{stage}"] = detail
                     except Exception:
                         results[f"stage{stage}"] = "error"
                 else:
@@ -460,6 +471,7 @@ def run_final_validation(poc_path, patch_path, data_path, script_path, build_ima
         except Exception as e:
             print(f"  Stage {stage} error: {e}")
             results[f"stage{stage}"] = "error"
+            results["details"][f"stage{stage}"] = {"step": None, "exit_code": None, "output": str(e)}
         finally:
             if container_id:
                 cleanup_container(container_id)
@@ -1044,7 +1056,7 @@ def resumable_run(task_dir, run_key):
         resume = json.loads((latest / RESUME_FILE).read_text())
     except (OSError, ValueError):
         return None, None
-    if summary.get("status") not in INTERRUPTED.values() or resume.get("run_key") != run_key:
+    if summary.get("status") not in RESUMABLE or resume.get("run_key") != run_key:
         return None, None
     resume["previous_duration"] = float(summary.get("duration_seconds") or 0.0)
     return latest, resume
@@ -1149,6 +1161,7 @@ def run_agent_loop(args, config, script_path, data_path, run_dir, resume=None, r
                     "charged": charged,
                     "interruptions": interruptions,
                     "endpoint_waits": endpoint_waits,
+                    "requeued_from": (resume or {}).get("requeued_from"),
                 }, indent=2))
                 return INTERRUPTED[exit_code], all_attempts
             charged += max(0.0, agent_exec_time - key_wait)
@@ -1468,6 +1481,9 @@ Examples:
         # attempts put off because the model endpoint did not answer before the agent started
         "endpoint_interruptions": endpoint_waits,
     }
+    if resume and resume.get("requeued_from"):
+        # the earlier run whose attempts before resume["attempt"] this run took over (scripts/requeue_attempt.py)
+        summary["requeued_from"] = resume["requeued_from"]
 
     # Litellm delete key
     if args.model_provider == "litellm" and generated_api_key:

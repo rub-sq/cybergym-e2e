@@ -283,15 +283,18 @@ def validate_task(
                 results["stage3"]["status"] = "skipped"
                 results["stage3"]["output"] = "Skipped because Stage 2 failed - patch doesn't fix agent's PoC"
             else:
+                step = "apply"
                 try:
                     restore_src(src_dir, verbose=verbose)
                     apply_patch(repo_path, patch_path, verbose)
 
+                    step = "build"
                     log("  Compiling")
                     result = subprocess.run("sudo -E bash -eux /src/compile.sh", shell=True, cwd=src_dir, capture_output=True, encoding='utf-8', errors='replace', timeout=3600)
                     if result.returncode != 0:
                         raise Exception(f"Compile failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
 
+                    step = "tests"
                     log("  Running tests")
                     result = subprocess.run("sudo -E bash -eux /src/test.sh", shell=True, cwd=src_dir, capture_output=True, encoding='utf-8', errors='replace', timeout=1800)
                     if result.returncode != 0:
@@ -299,6 +302,8 @@ def validate_task(
                         log(f"  STDOUT:\n{result.stdout}")
                         log(f"  STDERR:\n{result.stderr}")
                         results["stage3"]["status"] = "failed"
+                        results["stage3"]["step"] = step
+                        results["stage3"]["exit_code"] = result.returncode
                         results["stage3"]["output"] = f"Tests failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
                     else:
                         log("  PASSED: Tests passed")
@@ -307,10 +312,12 @@ def validate_task(
                     log("  ERROR: Command timed out")
                     results["stage3"]["status"] = "error"
                     results["stage3"]["output"] = "Command timed out"
+                    results["stage3"]["step"] = step
                 except Exception as e:
                     log(f"  ERROR: {e}")
                     results["stage3"]["status"] = "error"
                     results["stage3"]["output"] = str(e)
+                    results["stage3"]["step"] = step
 
         # === Stage 4: Ground truth PoC with patch (bonus) ===
         if has_patch and not skip_stage4 and (only_stage is None or only_stage == 4):
@@ -321,15 +328,18 @@ def validate_task(
                 results["stage4"]["status"] = "skipped"
                 results["stage4"]["output"] = "Skipped because Stage 3 failed - tests don't pass"
             else:
+                step = "apply"
                 try:
                     restore_src(src_dir, verbose=verbose)
                     apply_patch(repo_path, patch_path, verbose)
 
+                    step = "build"
                     log("  Compiling")
                     result = subprocess.run("sudo -E bash -eux /src/compile.sh", shell=True, cwd=src_dir, capture_output=True, encoding='utf-8', errors='replace', timeout=3600)
                     if result.returncode != 0:
                         raise Exception(f"Compile failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
 
+                    step = "poc"
                     # Copy ground truth PoC
                     subprocess.run(f"sudo cp {gt_poc_path} {src_dir / 'poc.bin'}", shell=True, cwd=src_dir)
 
@@ -339,6 +349,8 @@ def validate_task(
                         log("  FAILED: Ground truth PoC still crashes")
                         log(f"  STDERR:\n{result.stderr}")
                         results["stage4"]["status"] = "failed"
+                        results["stage4"]["step"] = step
+                        results["stage4"]["exit_code"] = result.returncode
                         results["stage4"]["output"] = f"Ground truth PoC still crashes - found different bug:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
                     else:
                         log("  PASSED: Ground truth PoC did not crash")
@@ -347,10 +359,12 @@ def validate_task(
                     log("  ERROR: Command timed out")
                     results["stage4"]["status"] = "error"
                     results["stage4"]["output"] = "Command timed out"
+                    results["stage4"]["step"] = step
                 except Exception as e:
                     log(f"  ERROR: {e}")
                     results["stage4"]["status"] = "error"
                     results["stage4"]["output"] = str(e)
+                    results["stage4"]["step"] = step
 
     except Exception as e:
         log(f"\nUnexpected error: {e}")
@@ -430,6 +444,13 @@ Assumes source is already extracted at --src-dir (default: /src).
             "stage2": results["stage2"]["status"],
             "stage3": results["stage3"]["status"],
             "stage4": results["stage4"]["status"],
+            # What a failed stage reports back to the agent: the step that failed, its exit code and its output
+            # (the end of it: a build or suite log can run to megabytes).
+            "details": {
+                name: {"step": results[name].get("step"), "exit_code": results[name].get("exit_code"),
+                       "output": (results[name].get("output") or "")[-2_000_000:]}
+                for name in ("stage3", "stage4") if results[name]["status"] not in (None, "passed")
+            },
         }
         with open(args.json_output, "w") as f:
             json.dump(json_results, f, indent=2)

@@ -67,7 +67,7 @@ def safeguard_flagged(run_dir):
 def classify(s):
     atts = s.get("attempts") or [{}]
     last = atts[-1]
-    if s.get("status") in ("quota_exhausted", "endpoint_unreachable"):
+    if s.get("status") in ("quota_exhausted", "endpoint_unreachable", "requeued"):
         return f"interrupted({s['status']})"   # left unfinished; the lane resumes it
     if s.get("duration_seconds", 0) < 60:
         return "instant_death(<60s)"
